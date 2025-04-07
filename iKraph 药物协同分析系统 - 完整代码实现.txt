@@ -1,0 +1,5743 @@
+iKraph 药物协同分析系统 - 完整代码实现
+基于您提供的项目目录结构和batch_main_xin_4_7.py文件，我已经为您创建了完整的代码实现。下面是每个文件的详细代码：
+
+配置文件
+config/__init__.py
+python
+# 空文件，使config成为一个包
+config/settings.py
+python
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+全局配置参数模块
+定义系统运行所需的全局配置参数
+"""
+
+import os
+import multiprocessing
+
+# 数据加载配置
+DATA_LOADING = {
+    'chunk_size': 1000000,
+    'buffer_size': 50*1024*1024,
+    'parallel_chunks': 24,
+    'process_count': max(1, multiprocessing.cpu_count() * 3 // 4),  # 默认使用75%的CPU核心
+    'low_memory': False,
+    'load_method': 'auto'
+}
+
+# 分析配置
+ANALYSIS = {
+    'min_confidence': 0.5,
+    'max_path_length': 2,
+    'psr_algorithm': 'default',
+    'viz_sample': 1000,
+    'exact_match': False
+}
+
+# 路径配置
+PATHS = {
+    'data_dir': './data',
+    'output_dir': './output',
+    'tables_dir': './output/tables',
+    'graphs_dir': './output/graphs',
+    'reports_dir': './output/reports',
+}
+
+# 确保输出目录存在
+for path in [PATHS['output_dir'], PATHS['tables_dir'], PATHS['graphs_dir'], PATHS['reports_dir']]:
+    os.makedirs(path, exist_ok=True)
+
+# 日志配置
+LOGGING = {
+    'level': 'INFO',
+    'format': '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    'file': 'extraction.log'
+}
+
+# 实体类型配置
+ENTITY_TYPES = {
+    'DRUG': ['Chemical', 'Drug'],
+    'DISEASE': ['Disease'],
+    'GENE': ['Gene', 'Protein'],
+    'PATHWAY': ['Pathway'],
+    'ALL': []  # 空列表表示所有类型
+}
+
+# 关系条件配置
+RELATION_FILTERS = {
+    'min_documents': 1,  # 最少文献支持数量
+    'min_score': 0.0,    # 最小分数
+    'recent_only': False, # 是否仅使用最近的关系
+    'years_threshold': 5  # 如果recent_only为True，仅使用最近几年的数据
+}
+config/relation_types.py
+python
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+关系类型定义模块
+基于RelTypeInt.json定义关系类型和方向性
+"""
+
+import os
+import json
+import logging
+
+# 关系方向常量
+DIRECTION_POSITIVE = 1   # 正向关系，如激活、促进
+DIRECTION_NEGATIVE = -1  # 负向关系，如抑制、减轻
+DIRECTION_NEUTRAL = 0    # 中性关系，如关联但无明确方向
+DIRECTION_UNKNOWN = None # 未知方向
+
+# 预定义的关系类型映射
+RELATION_TYPES = {
+    "1": {"name": "Association", "direction": DIRECTION_NEUTRAL, "precision": 0.5},
+    "2": {"name": "Positive_Correlation", "direction": DIRECTION_POSITIVE, "precision": 0.8},
+    "3": {"name": "Negative_Correlation", "direction": DIRECTION_NEGATIVE, "precision": 0.8},
+    "5": {"name": "Cotreatment", "direction": DIRECTION_NEUTRAL, "precision": 0.7},
+    "7": {"name": "Drug_Interaction", "direction": DIRECTION_NEUTRAL, "precision": 0.8},
+    "10": {"name": "Disease_Gene", "direction": DIRECTION_NEUTRAL, "precision": 0.7},
+    "11": {"name": "Causes", "direction": DIRECTION_POSITIVE, "precision": 0.8},
+    "12": {"name": "Regulates", "direction": [DIRECTION_POSITIVE, DIRECTION_NEGATIVE], "precision": 0.7},
+    "16": {"name": "Treats", "direction": DIRECTION_NEGATIVE, "precision": 0.9},
+    "19": {"name": "Palliates", "direction": DIRECTION_NEGATIVE, "precision": 0.8},
+    "20": {"name": "Chemical_Gene", "direction": [DIRECTION_POSITIVE, DIRECTION_NEGATIVE], "precision": 0.7},
+    "21": {"name": "Drug_Protein", "direction": [DIRECTION_POSITIVE, DIRECTION_NEGATIVE], "precision": 0.7},
+    "23": {"name": "Chemical_Disease", "direction": [DIRECTION_POSITIVE, DIRECTION_NEGATIVE], "precision": 0.7},
+    "25": {"name": "Drug_Drug", "direction": DIRECTION_NEUTRAL, "precision": 0.7},
+    "28": {"name": "Disease_Phenotype_Negative", "direction": DIRECTION_NEGATIVE, "precision": 0.7},
+    "29": {"name": "Disease_Phenotype_Positive", "direction": DIRECTION_POSITIVE, "precision": 0.7},
+    "32": {"name": "Drug_Effect", "direction": [DIRECTION_POSITIVE, DIRECTION_NEGATIVE], "precision": 0.7},
+    "40": {"name": "Exposure_Disease", "direction": DIRECTION_POSITIVE, "precision": 0.7},
+    "45": {"name": "Pathway_Pathway", "direction": DIRECTION_NEUTRAL, "precision": 0.7},
+    "46": {"name": "Pathway_Protein", "direction": DIRECTION_NEUTRAL, "precision": 0.7},
+    "48": {"name": "Anatomy_Protein_Present", "direction": DIRECTION_POSITIVE, "precision": 0.8},
+    "49": {"name": "Anatomy_Protein_Absent", "direction": DIRECTION_NEGATIVE, "precision": 0.8},
+    "50": {"name": "Drug_Target", "direction": [DIRECTION_POSITIVE, DIRECTION_NEGATIVE, DIRECTION_NEUTRAL], "precision": 0.8},
+    "51": {"name": "Target_Disease", "direction": [DIRECTION_POSITIVE, DIRECTION_NEGATIVE], "precision": 0.7},
+    "52": {"name": "Biomarker_Disease", "direction": [DIRECTION_POSITIVE, DIRECTION_NEGATIVE], "precision": 0.7}
+}
+
+# 重点关系类型分组
+KEY_RELATION_TYPES = {
+    "drug_target": ["21", "50"],  # 药物-靶点关系
+    "drug_disease": ["16", "19", "23"],  # 药物-疾病关系
+    "gene_disease": ["10", "51", "52"],  # 基因-疾病关系
+    "toxicity": ["11", "23", "40"],  # 毒性相关关系
+    "synergy": ["5", "7", "25"],  # 协同相关关系
+    "regulation": ["2", "3", "12"]  # 调节关系
+}
+
+def load_relation_types(schema_file):
+    """
+    从RelTypeInt.json加载完整的关系类型定义
+    
+    Parameters:
+    - schema_file: RelTypeInt.json文件路径
+    
+    Returns:
+    - 完整的关系类型映射字典
+    """
+    relation_types = RELATION_TYPES.copy()  # 从预定义映射开始
+    
+    try:
+        if not os.path.exists(schema_file):
+            logging.warning(f"关系类型模式文件 {schema_file} 不存在，使用预定义映射")
+            return relation_types
+        
+        with open(schema_file, 'r', encoding='utf-8') as f:
+            schema_data = json.load(f)
+        
+        # 更新关系类型映射
+        for rel in schema_data:
+            int_rep = rel["intRep"]
+            rel_type = rel["relType"]
+            cor_type = rel.get("corType", [0])  # 默认为中性
+            
+            # 确定方向
+            if 1 in cor_type and -1 in cor_type:
+                direction = [DIRECTION_POSITIVE, DIRECTION_NEGATIVE]
+            elif 1 in cor_type:
+                direction = DIRECTION_POSITIVE
+            elif -1 in cor_type:
+                direction = DIRECTION_NEGATIVE
+            else:
+                direction = DIRECTION_NEUTRAL
+            
+            # 更新或添加关系类型
+            relation_types[int_rep] = {
+                "name": rel_type,
+                "direction": direction,
+                "precision": rel.get("relPrec", 0.5)
+            }
+        
+        logging.info(f"从 {schema_file} 加载了 {len(schema_data)} 种关系类型")
+        return relation_types
+    
+    except Exception as e:
+        logging.error(f"加载关系类型失败: {e}")
+        return relation_types
+
+def get_relation_direction(relation_type_id, context=None):
+    """
+    获取关系的方向
+    
+    Parameters:
+    - relation_type_id: 关系类型ID
+    - context: 关系上下文，用于判断方向（例如，对于治疗关系，正面上下文表示治疗效果）
+    
+    Returns:
+    - 关系方向（1: 正向, -1: 负向, 0: 中性, None: 未知）
+    """
+    if relation_type_id not in RELATION_TYPES:
+        return DIRECTION_UNKNOWN
+    
+    direction = RELATION_TYPES[relation_type_id]["direction"]
+    
+    # 如果方向是列表（多种可能），则根据上下文确定
+    if isinstance(direction, list):
+        # 根据上下文判断方向
+        if context is not None:
+            if relation_type_id == "23":  # Chemical_Disease
+                # 根据上下文判断是治疗关系还是不良反应
+                if context.get("is_treatment", False):
+                    return DIRECTION_NEGATIVE  # 治疗是负向关系（减轻疾病）
+                elif context.get("is_adverse", False):
+                    return DIRECTION_POSITIVE  # 不良反应是正向关系（导致疾病）
+            
+            if relation_type_id in ["20", "21", "50"]:  # 药物-基因关系
+                # 根据上下文判断是激活还是抑制
+                if context.get("is_activation", False):
+                    return DIRECTION_POSITIVE
+                elif context.get("is_inhibition", False):
+                    return DIRECTION_NEGATIVE
+        
+        # 如果无法确定，返回第一个方向作为默认值
+        return direction[0]
+    
+    return direction
+
+def is_positive_relation(relation_type_id, context=None):
+    """
+    判断是否为正向关系
+    
+    Parameters:
+    - relation_type_id: 关系类型ID
+    - context: 关系上下文
+    
+    Returns:
+    - 是否为正向关系
+    """
+    return get_relation_direction(relation_type_id, context) == DIRECTION_POSITIVE
+
+def is_negative_relation(relation_type_id, context=None):
+    """
+    判断是否为负向关系
+    
+    Parameters:
+    - relation_type_id: 关系类型ID
+    - context: 关系上下文
+    
+    Returns:
+    - 是否为负向关系
+    """
+    return get_relation_direction(relation_type_id, context) == DIRECTION_NEGATIVE
+
+def get_relation_precision(relation_type_id):
+    """
+    获取关系的精确度
+    
+    Parameters:
+    - relation_type_id: 关系类型ID
+    
+    Returns:
+    - 关系精确度（0-1的浮点数）
+    """
+    if relation_type_id not in RELATION_TYPES:
+        return 0.5  # 默认中等精确度
+    
+    return RELATION_TYPES[relation_type_id].get("precision", 0.5)
+核心模块
+core/__init__.py
+python
+# 空文件，使core成为一个包
+core/data_loader.py
+python
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+数据加载模块
+提供高效的数据加载功能，从batch_main_xin_4_7.py移植而来
+"""
+
+import os
+import sys
+import logging
+import pandas as pd
+import numpy as np
+import json
+import mmap 
+import multiprocessing
+import gc
+import psutil
+import warnings
+from typing import Union, List, Dict, Generator
+
+# 尝试导入可选依赖
+try:
+    import orjson
+except ImportError:
+    orjson = None
+
+try:
+    import rapidjson
+except ImportError:
+    rapidjson = None
+
+# 禁用不相关的警告
+warnings.filterwarnings("ignore", category=pd.errors.SettingWithCopyWarning)
+warnings.filterwarnings("ignore", category=FutureWarning)
+
+logger = logging.getLogger(__name__)
+
+def load_json_file(file_path, chunk_size=None, low_memory=False, method='auto'):
+    """Smart JSON loader using RapidJSON for maximum performance"""
+    try:
+        logger.info(f"Loading file: {file_path}")
+        file_size = os.path.getsize(file_path) / (1024 * 1024)
+        logger.info(f"File size: {file_size:.2f} MB")
+
+        # 检查是否可以使用RapidJSON
+        if rapidjson is not None:
+            # Configure RapidJSON options
+            parse_options = rapidjson.PM_TRAILING_COMMAS | rapidjson.PM_COMMENTS | rapidjson.PM_NONE
+            
+            # For smaller files, load directly
+            if file_size < 500:  # Less than 500MB
+                with open(file_path, 'rb') as f:
+                    content = f.read()
+                    data = rapidjson.loads(content, parse_mode=parse_options)
+                    
+                    # Ensure data is a list
+                    if isinstance(data, dict):
+                        data = list(data.values())
+                    elif not isinstance(data, list):
+                        data = [data]
+                    
+                    logger.info(f"Loaded {len(data)} entries with RapidJSON")
+                    return data
+            
+            # For larger files, stream process
+            else:
+                results = []
+                for batch in load_large_json_streaming_rapidjson(file_path, batch_size=chunk_size or 100000):
+                    results.extend(batch)
+                
+                logger.info(f"Loaded {len(results)} entries via RapidJSON streaming")
+                return results
+                
+        # 如果没有RapidJSON，尝试orjson
+        elif orjson is not None and method in ['auto', 'orjson']:
+            logger.info("Using orjson for parsing")
+            with open(file_path, 'rb') as f:
+                content = f.read()
+                data = orjson.loads(content)
+                
+                # Ensure data is a list
+                if isinstance(data, dict):
+                    data = list(data.values())
+                elif not isinstance(data, list):
+                    data = [data]
+                
+                logger.info(f"Loaded {len(data)} entries with orjson")
+                return data
+                
+        # 如果都没有，回退到标准json
+        else:
+            logger.info("Using standard json for parsing")
+            with open(file_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                
+                # Ensure data is a list
+                if isinstance(data, dict):
+                    data = list(data.values())
+                elif not isinstance(data, list):
+                    data = [data]
+                
+                logger.info(f"Loaded {len(data)} entries with standard json")
+                return data
+
+    except Exception as e:
+        logger.error(f"Error loading file {file_path}: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return []
+
+def stream_load_json(file_path, chunk_size=1000000):
+    """以流的方式加载大型JSON文件"""
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            # 先读取开头确定是列表还是对象
+            start_pos = f.tell()
+            first_char = f.read(1).strip()
+            f.seek(start_pos)  # 回到起始位置
+            
+            if first_char == '[':  # 处理JSON列表
+                # 读取开头的 '['
+                f.read(1)
+                comma = ""
+                buffer = ""
+                chunk = []
+                
+                for line in f:
+                    buffer += line
+                    # 初步解析以查找完整的JSON对象
+                    open_braces = buffer.count('{')
+                    close_braces = buffer.count('}')
+                    
+                    if open_braces == close_braces and open_braces > 0:
+                        # 清理尾部的逗号
+                        if buffer.rstrip().endswith(','):
+                            buffer = buffer.rstrip()[:-1]
+                        
+                        try:
+                            item = json.loads(comma + buffer)
+                            chunk.append(item)
+                            
+                            if len(chunk) >= chunk_size:
+                                yield chunk
+                                chunk = []
+                                
+                            comma = ","
+                            buffer = ""
+                        except json.JSONDecodeError:
+                            # 不完整的对象，继续读取
+                            pass
+                
+                # 返回最后一个块
+                if chunk:
+                    yield chunk
+            
+            elif first_char == '{':  # 处理JSON对象
+                data = json.load(f)
+                # 对于对象，我们按键值对进行分块
+                keys = list(data.keys())
+                for i in range(0, len(keys), chunk_size):
+                    chunk = {k: data[k] for k in keys[i:i+chunk_size]}
+                    yield chunk
+            
+            else:
+                logger.error(f"不支持的JSON格式: {first_char}")
+                yield {}
+                
+    except Exception as e:
+        logger.error(f"流式加载JSON文件 {file_path} 失败: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        yield {}
+
+def load_large_json_streaming_rapidjson(file_path: str, batch_size: int = 100000, entity_ids=None):
+    """
+    Ultra-fast streaming processor for large JSON files using RapidJSON
+    """
+    if rapidjson is None:
+        logger.error("RapidJSON not available, please install 'python-rapidjson' package")
+        return
+        
+    logger.info(f"Using RapidJSON stream reader for file: {file_path}")
+    file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
+    logger.info(f"File size: {file_size_mb:.2f} MB")
+
+    try:
+        # Set up RapidJSON parsing parameters for maximum speed
+        parse_options = rapidjson.PM_TRAILING_COMMAS | rapidjson.PM_COMMENTS | rapidjson.PM_NONE
+        
+        # Use a buffered reader approach with RapidJSON
+        with open(file_path, 'rb') as f:
+            # Check file format
+            first_char = f.read(1)
+            f.seek(0)  # Reset to beginning
+            
+            if first_char == b'[':  # JSON array format
+                # Skip the opening bracket
+                f.read(1)
+                
+                # Initialize processing variables
+                buffer_size = 50 * 1024 * 1024  # 50MB buffer
+                items_batch = []
+                object_count = 0
+                
+                # Process file in chunks with RapidJSON's streaming parser
+                current_object = bytearray()
+                depth = 0
+                in_object = False
+                in_string = False
+                escape_next = False
+                
+                while True:
+                    chunk = f.read(buffer_size)
+                    if not chunk:
+                        break
+                    
+                    i = 0
+                    while i < len(chunk):
+                        byte = chunk[i]
+                        i += 1
+                        
+                        # String handling with escape sequences
+                        if escape_next:
+                            escape_next = False
+                            current_object.append(byte)
+                            continue
+                        
+                        if in_string:
+                            if byte == 92:  # backslash
+                                escape_next = True
+                            elif byte == 34:  # double quote
+                                in_string = False
+                            current_object.append(byte)
+                            continue
+                        
+                        if byte == 34:  # double quote
+                            in_string = True
+                            current_object.append(byte)
+                            continue
+                            
+                        # Handle nested objects
+                        if byte == 123:  # opening brace {
+                            if not in_object:
+                                in_object = True
+                                current_object = bytearray([byte])
+                            else:
+                                current_object.append(byte)
+                            depth += 1
+                        elif byte == 125:  # closing brace }
+                            current_object.append(byte)
+                            depth -= 1
+                            
+                            # Complete object found
+                            if depth == 0 and in_object:
+                                try:
+                                    # Parse with RapidJSON for maximum speed
+                                    item = rapidjson.loads(current_object, parse_mode=parse_options)
+                                    
+                                    # Filter by entity IDs if provided
+                                    if entity_ids and isinstance(item, dict) and "id" in item:
+                                        rel_id = item["id"]
+                                        parts = rel_id.split(".")
+                                        if len(parts) >= 2:
+                                            source_id = parts[0]
+                                            target_id = parts[1]
+                                            if source_id in entity_ids or target_id in entity_ids:
+                                                items_batch.append(item)
+                                    else:
+                                        items_batch.append(item)
+                                    
+                                    object_count += 1
+                                    
+                                    # Return batch when it reaches threshold
+                                    if len(items_batch) >= batch_size:
+                                        yield items_batch
+                                        items_batch = []
+                                    
+                                except Exception as e:
+                                    pass  # Skip malformed objects
+                                
+                                # Reset state
+                                in_object = False
+                                current_object = bytearray()
+                        elif in_object:
+                            current_object.append(byte)
+                
+                # Return any remaining items
+                if items_batch:
+                    yield items_batch
+                
+                logger.info(f"Processed {object_count} JSON objects with RapidJSON")
+            else:
+                logger.error(f"Unsupported JSON format - expected array starting with '['")
+                yield []
+                
+    except Exception as e:
+        logger.error(f"Error streaming JSON file with RapidJSON: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        yield []
+
+def stream_json_array(file_path: str, batch_size: int = 10000) -> Generator[List[Dict], None, None]:
+    """
+    流式读取大型JSON文件的生成器函数
+    
+    参数:
+    - file_path: JSON文件路径
+    - batch_size: 每批次读取的数据量
+    
+    返回:
+    - 生成器，每次生成一批JSON数据
+    """
+    try:
+        # 打开文件并检查文件格式
+        with open(file_path, 'r', encoding='utf-8') as f:
+            # 读取文件第一个非空白字符
+            first_char = f.read(1).strip()
+            f.seek(0)  # 重置文件指针
+
+            # 根据文件开头的字符判断文件类型
+            if first_char == '[':
+                # JSON数组格式
+                data = json.load(f)
+                
+                # 将大数组分批处理
+                for i in range(0, len(data), batch_size):
+                    yield data[i:i+batch_size]
+            
+            elif first_char == '{':
+                # JSON对象格式
+                data = json.load(f)
+                keys = list(data.keys())
+                
+                # 将对象按批次生成
+                for i in range(0, len(keys), batch_size):
+                    batch_keys = keys[i:i+batch_size]
+                    yield {k: data[k] for k in batch_keys}
+            
+            else:
+                # 无法识别的JSON格式
+                logger.error(f"不支持的JSON文件格式: {first_char}")
+                yield []
+
+    except Exception as e:
+        logger.error(f"流式读取 JSON 文件 {file_path} 失败: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        yield []
+
+def _load_with_memory_mapping(file_path: str) -> List[Dict]:
+    """
+    使用内存映射方式加载大文件
+    
+    优点：
+    - 不需要一次性将整个文件加载到内存
+    - 可以处理超大文件
+    - 访问速度快
+    
+    Parameters:
+    - file_path: JSON文件路径
+    
+    Returns:
+    - 解析后的数据列表
+    """
+    try:
+        # 使用流式读取方法，避免一次性加载整个文件
+        def json_parse_stream(mm):
+            decoder = json.JSONDecoder()
+            pos = 0
+            data = []
+            while True:
+                try:
+                    # 尝试解析下一个 JSON 对象
+                    result, pos = decoder.raw_decode(mm[pos:].decode('utf-8'))
+                    data.append(result)
+                except json.JSONDecodeError:
+                    # 如果无法解析，可能是到达文件末尾
+                    break
+            return data
+
+        # 打开文件并使用内存映射
+        with open(file_path, 'rb') as f:
+            # 使用内存映射
+            mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+            
+            # 使用流式解析方法
+            data = json_parse_stream(mm)
+            
+            # 关闭内存映射
+            mm.close()
+            
+            # 确保返回列表
+            return data if isinstance(data, list) else [data]
+    
+    except Exception as e:
+        logger.error(f"内存映射加载失败: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return []
+
+def parallel_json_load(
+    file_path: str, 
+    num_processes: int = None, 
+    chunk_size: int = 10_000_000
+) -> List[Dict]:
+    """
+    并行加载大型JSON文件
+    
+    Parameters:
+    - file_path: JSON文件路径
+    - num_processes: 并行进程数
+    - chunk_size: 每个进程处理的块大小
+    
+    Returns:
+    - 合并后的数据列表
+    """
+    if num_processes is None:
+        num_processes = os.cpu_count()
+    
+    file_size = os.path.getsize(file_path)
+    chunk_size = min(chunk_size, file_size // num_processes)
+    
+    def load_chunk(start: int, size: int) -> List[Dict]:
+        try:
+            with open(file_path, 'rb') as f:
+                f.seek(start)
+                chunk = f.read(size)
+                # 尝试使用orjson，如果可用的话
+                if orjson is not None:
+                    return orjson.loads(chunk) if chunk else []
+                else:
+                    return json.loads(chunk) if chunk else []
+        except Exception as e:
+            logger.error(f"加载文件块失败: {e}")
+            return []
+    
+    with multiprocessing.Pool(processes=num_processes) as pool:
+        args = [(i*chunk_size, chunk_size) for i in range(num_processes)]
+        results = pool.starmap(load_chunk, args)
+    
+    # 安全地合并结果
+    merged_data = [
+        item for chunk in results 
+        if isinstance(chunk, list) 
+        for item in chunk
+    ]
+    
+    return merged_data
+
+def enable_large_dataset_processing():
+    """配置系统处理大型数据集"""
+    # 获取系统内存信息
+    mem_info = psutil.virtual_memory()
+    logger.info(f"系统内存: 总计={mem_info.total/(1024**3):.1f}GB, 可用={mem_info.available/(1024**3):.1f}GB")
+    
+    # 为pandas设置较大的显示选项
+    pd.set_option('display.max_rows', 100)
+    pd.set_option('display.max_columns', 100)
+    
+    # 禁用pandas的SettingWithCopyWarning
+    pd.options.mode.chained_assignment = None
+    
+    # 配置matplotlib以处理大型图表
+    try:
+        import matplotlib as mpl
+        mpl.rcParams['agg.path.chunksize'] = 10000
+    except ImportError:
+        pass
+    
+    # 设置numpy以支持大型数组
+    np.set_printoptions(threshold=10000)
+    
+    # 设置CPU亲和性以提高性能
+    try:
+        p = psutil.Process()
+        if hasattr(p, 'cpu_affinity'):
+            p.cpu_affinity(list(range(psutil.cpu_count())))
+    except Exception as e:
+        logger.warning(f"无法设置CPU亲和性: {e}")
+    
+    logger.info("系统已配置为处理大型数据集")
+core/entity_extractor.py
+python
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+实体提取模块
+提供从iKraph知识图谱中提取实体的功能
+"""
+
+import logging
+import pandas as pd
+from tqdm import tqdm
+import gc
+from typing import List, Dict, Tuple, Set, Union
+
+logger = logging.getLogger(__name__)
+
+def clean_non_ascii_chars(text, preserve_greek=True):
+    """
+    高级文本清理，使用Unicode规范化处理希腊字母
+    """
+    if not isinstance(text, str):
+        return text
+    
+    import unicodedata
+    import re
+    
+    # 选项1：使用Unicode规范化（保留希腊字母实际形式）
+    if preserve_greek:
+        # 基于Unicode块确定希腊字母
+        def is_greek(char):
+            return 'GREEK' in unicodedata.name(char, '')
+        
+        # 处理文本，保留希腊字母
+        result = ""
+        for char in text:
+            if char.isascii() or is_greek(char):
+                result += char
+            else:
+                # 尝试用NFKD分解获取ASCII等价形式
+                normalized = unicodedata.normalize('NFKD', char)
+                if all(c.isascii() for c in normalized):
+                    result += normalized
+        
+        # 清理多余空格
+        return re.sub(r'\s+', ' ', result).strip()
+    else:
+        # 如果不需要保留希腊字母，使用简单的ASCII过滤
+        cleaned_text = re.sub(r'[^\x00-\x7F]+', '', text)
+        return re.sub(r'\s+', ' ', cleaned_text).strip()
+
+def extract_entities_from_nodes(nodes_data, keywords=None, entity_types=None, exact_match=False, low_memory=False):
+    """Extract entities from node data, with option for exact matching and cleaning Chinese characters"""
+    logger.info("Extracting entities from node data...")
+    
+    # If keywords provided, convert to lowercase for case-insensitive matching
+    if keywords:
+        keywords = [k.lower() for k in keywords]
+    
+    # Ensure nodes_data is a list
+    if not isinstance(nodes_data, list):
+        logger.error(f"Unexpected data type: {type(nodes_data)}")
+        return [], {}
+    
+    entities = []
+    entity_id_map = {}  # For mapping biokdeid to new sequential ID
+    
+    # Process all entities
+    total_entities = len(nodes_data)
+    logger.info(f"Total entity count: {total_entities}")
+    
+    # Process keyword entities first
+    keyword_entities = []
+    non_keyword_entities = []
+    
+    for node in tqdm(nodes_data, desc="Processing entities", total=total_entities):
+        # Ensure node is a dictionary
+        if not isinstance(node, dict):
+            logger.warning(f"Skipping non-dictionary node: {type(node)}")
+            continue
+        
+        # Check if it's a keyword entity using exact or partial matching
+        is_keyword = False
+        if keywords:
+            official_name = str(node.get("official name", "")).lower()
+            common_name = str(node.get("common name", "")).lower()
+            
+            for keyword in keywords:
+                if exact_match:
+                    # Exact match (case-insensitive)
+                    if keyword == official_name or keyword == common_name:
+                        is_keyword = True
+                        break
+                else:
+                    # Partial match (case-insensitive)
+                    if keyword in official_name or keyword in common_name:
+                        is_keyword = True
+                        break
+        
+        # Filter entity types
+        entity_type = node.get("type", "")
+        if entity_types and entity_type not in entity_types and not is_keyword:
+            continue
+        
+        # Clean names of Chinese characters, but preserve Greek letters
+        cleaned_official_name = clean_non_ascii_chars(node.get("official name", ""), preserve_greek=True)
+        cleaned_common_name = clean_non_ascii_chars(node.get("common name", ""), preserve_greek=True)
+        
+        # Create entity record
+        entity = {
+            "Original ID": node.get("biokdeid", ""),
+            "Name": cleaned_common_name if cleaned_common_name else cleaned_official_name,
+            "Official_Name": cleaned_official_name,
+            "Common_Name": cleaned_common_name,
+            "Type": entity_type,
+            "Subtype": node.get("subtype", ""),
+            "External ID": node.get("id", ""),
+            "Species": ", ".join(map(str, node.get("species", []))) if node.get("species") else "",
+            "Is Keyword": is_keyword
+        }
+        
+        if is_keyword:
+            keyword_entities.append(entity)
+        elif entity_types and entity_type in entity_types:
+            non_keyword_entities.append(entity)
+        
+        # In low memory mode, periodically clean up
+        if low_memory and len(non_keyword_entities) % 1000000 == 0:
+            gc.collect()
+    
+    # Merge keyword entities and other entities
+    logger.info(f"Found {len(keyword_entities)} keyword entities and {len(non_keyword_entities)} non-keyword entities")
+    all_entities = keyword_entities + non_keyword_entities
+    
+    # Assign sequential IDs to entities
+    for i, entity in enumerate(all_entities):
+        entity["ID"] = i + 1
+        entity_id_map[entity["Original ID"]] = entity["ID"]
+    
+    logger.info(f"Extracted {len(all_entities)} entities (including {len(keyword_entities)} keyword entities)")
+    return all_entities, entity_id_map
+
+def extract_keyword_entities(nodes_data, keywords=None, entity_types=None, exact_match=False):
+    """
+    从节点数据中提取符合特定关键词和实体类型的实体
+    
+    Parameters:
+    - nodes_data: 节点数据列表
+    - keywords: 关键词列表
+    - entity_types: 实体类型列表
+    - exact_match: 是否使用精确匹配（默认为False，使用部分匹配）
+    
+    Returns:
+    - 符合条件的实体列表和ID映射
+    """
+    logger.info(f"提取关键词实体: 关键词={keywords}, 实体类型={entity_types}, 精确匹配={exact_match}")
+    
+    # 如果提供了关键词，转换为小写以进行不区分大小写的匹配
+    if keywords:
+        keywords = [k.lower() for k in keywords]
+    
+    # 确保nodes_data是列表
+    if not isinstance(nodes_data, list):
+        logger.error(f"意外的数据类型: {type(nodes_data)}")
+        return [], {}
+    
+    matched_entities = []
+    entity_id_map = {}  # 用于映射biokdeid到新的顺序ID
+    
+    # 遍历所有节点
+    total_nodes = len(nodes_data)
+    for node in tqdm(nodes_data, desc="处理关键词实体", total=total_nodes):
+        # 确保节点是字典
+        if not isinstance(node, dict):
+            continue
+        
+        # 获取实体名称（不区分大小写）
+        official_name = str(node.get("official name", "")).lower()
+        common_name = str(node.get("common name", "")).lower()
+        
+        # 获取实体类型
+        entity_type = node.get("type", "")
+        
+        # 检查实体类型是否匹配
+        type_match = not entity_types or entity_type in entity_types
+        if not type_match:
+            continue
+        
+        # 检查关键词是否匹配
+        keyword_match = False
+        if keywords:
+            for keyword in keywords:
+                if exact_match:
+                    # 精确匹配（不区分大小写）
+                    if keyword == official_name or keyword == common_name:
+                        keyword_match = True
+                        break
+                else:
+                    # 部分匹配（不区分大小写）
+                    if keyword in official_name or keyword in common_name:
+                        keyword_match = True
+                        break
+        else:
+            # 如果没有提供关键词，则默认匹配所有实体类型符合的实体
+            keyword_match = True
+        
+        # 如果同时满足类型和关键词匹配条件
+        if type_match and keyword_match:
+            # 清理名称中的非ASCII字符，但保留希腊字母
+            cleaned_official_name = clean_non_ascii_chars(node.get("official name", ""), preserve_greek=True)
+            cleaned_common_name = clean_non_ascii_chars(node.get("common name", ""), preserve_greek=True)
+            
+            # 创建实体记录
+            entity = {
+                "Original ID": node.get("biokdeid", ""),
+                "Name": cleaned_common_name if cleaned_common_name else cleaned_official_name,
+                "Official_Name": cleaned_official_name,
+                "Common_Name": cleaned_common_name,
+                "Type": entity_type,
+                "Subtype": node.get("subtype", ""),
+                "External ID": node.get("id", ""),
+                "Species": ", ".join(map(str, node.get("species", []))) if node.get("species") else "",
+                "Is Keyword": True  # 标记为关键词实体
+            }
+            
+            matched_entities.append(entity)
+    
+    # 为匹配的实体分配顺序ID
+    for i, entity in enumerate(matched_entities):
+        entity["ID"] = i + 1
+        entity_id_map[entity["Original ID"]] = entity["ID"]
+    
+    logger.info(f"提取了 {len(matched_entities)} 个符合条件的关键词实体")
+    return matched_entities, entity_id_map
+
+def extract_entities_by_ids(nodes_data, entity_ids, entity_types=None):
+    """
+    根据实体ID列表从节点数据中提取实体
+    
+    Parameters:
+    - nodes_data: 节点数据列表
+    - entity_ids: 实体ID列表
+    - entity_types: 实体类型列表（可选）
+    
+    Returns:
+    - 符合条件的实体列表和ID映射
+    """
+    logger.info(f"根据ID提取实体: ID数量={len(entity_ids)}, 实体类型={entity_types}")
+    
+    # 确保nodes_data是列表
+    if not isinstance(nodes_data, list):
+        logger.error(f"意外的数据类型: {type(nodes_data)}")
+        return [], {}
+    
+    # 创建ID集合用于快速查找
+    entity_id_set = set(entity_ids)
+    
+    matched_entities = []
+    entity_id_map = {}  # 用于映射biokdeid到新的顺序ID
+    
+    # 遍历所有节点
+    for node in tqdm(nodes_data, desc="处理实体", total=len(nodes_data)):
+        # 确保节点是字典
+        if not isinstance(node, dict):
+            continue
+        
+        # 获取实体ID和类型
+        entity_id = node.get("biokdeid", "")
+        entity_type = node.get("type", "")
+        
+        # 检查ID是否在指定列表中
+        id_match = entity_id in entity_id_set
+        
+        # 检查实体类型是否匹配（如果指定了类型）
+        type_match = not entity_types or entity_type in entity_types
+        
+        # 如果ID和类型都匹配
+        if id_match and type_match:
+            # 清理名称中的非ASCII字符，但保留希腊字母
+            cleaned_official_name = clean_non_ascii_chars(node.get("official name", ""), preserve_greek=True)
+            cleaned_common_name = clean_non_ascii_chars(node.get("common name", ""), preserve_greek=True)
+            
+            # 创建实体记录
+            entity = {
+                "Original ID": entity_id,
+                "Name": cleaned_common_name if cleaned_common_name else cleaned_official_name,
+                "Official_Name": cleaned_official_name,
+                "Common_Name": cleaned_common_name,
+                "Type": entity_type,
+                "Subtype": node.get("subtype", ""),
+                "External ID": node.get("id", ""),
+                "Species": ", ".join(map(str, node.get("species", []))) if node.get("species") else "",
+                "Is Keyword": entity_id in entity_id_set  # 标记关键词实体
+            }
+            
+            matched_entities.append(entity)
+    
+    # 为匹配的实体分配顺序ID
+    for i, entity in enumerate(matched_entities):
+        entity["ID"] = i + 1
+        entity_id_map[entity["Original ID"]] = entity["ID"]
+    
+    logger.info(f"提取了 {len(matched_entities)} 个符合条件的实体")
+    return matched_entities, entity_id_map
+
+def extract_focal_entities(nodes_data, drug_keywords=None, disease_keywords=None, exact_match=False):
+    """
+    提取焦点实体（药物和疾病）
+    
+    Parameters:
+    - nodes_data: 节点数据列表
+    - drug_keywords: 药物关键词列表
+    - disease_keywords: 疾病关键词列表
+    - exact_match: 是否使用精确匹配
+    
+    Returns:
+    - 字典，包含药物和疾病实体及其ID映射
+    """
+    logger.info(f"提取焦点实体: 药物关键词={drug_keywords}, 疾病关键词={disease_keywords}")
+    
+    # 提取药物实体
+    drug_entities = []
+    drug_id_map = {}
+    
+    if drug_keywords:
+        drug_entities, drug_id_map = extract_keyword_entities(
+            nodes_data, 
+            keywords=drug_keywords,
+            entity_types=["Chemical"],
+            exact_match=exact_match
+        )
+        logger.info(f"提取了 {len(drug_entities)} 种药物")
+    
+    # 提取疾病实体
+    disease_entities = []
+    disease_id_map = {}
+    
+    if disease_keywords:
+        disease_entities, disease_id_map = extract_keyword_entities(
+            nodes_data, 
+            keywords=disease_keywords,
+            entity_types=["Disease"],
+            exact_match=exact_match
+        )
+        logger.info(f"提取了 {len(disease_entities)} 种疾病")
+    
+    # 合并ID映射
+    entity_id_map = {}
+    entity_id_map.update(drug_id_map)
+    entity_id_map.update(disease_id_map)
+    
+    # 合并实体列表
+    all_entities = drug_entities + disease_entities
+    
+    # 创建焦点实体结构
+    focal_entities = {
+        'drug': [entity["Original ID"] for entity in drug_entities],
+        'disease': [entity["Original ID"] for entity in disease_entities]
+    }
+    
+    result = {
+        'all_entities': all_entities,
+        'entity_id_map': entity_id_map,
+        'focal_entities': focal_entities,
+        'drug_entities': drug_entities,
+        'disease_entities': disease_entities
+    }
+    
+    return result
+
+def get_entity_by_keyword(entities_df, keyword, exact_match=False):
+    """
+    根据关键词从实体DataFrame中查找实体
+    
+    Parameters:
+    - entities_df: 实体DataFrame
+    - keyword: 关键词
+    - exact_match: 是否精确匹配
+    
+    Returns:
+    - 匹配的实体（如有多个，则返回第一个）
+    """
+    keyword = keyword.lower()
+    
+    if exact_match:
+        # 精确匹配
+        mask = (entities_df['Name'].str.lower() == keyword) | \
+               (entities_df['Official_Name'].str.lower() == keyword) | \
+               (entities_df['Common_Name'].str.lower() == keyword)
+    else:
+        # 部分匹配
+        mask = (entities_df['Name'].str.lower().str.contains(keyword, na=False)) | \
+               (entities_df['Official_Name'].str.lower().str.contains(keyword, na=False)) | \
+               (entities_df['Common_Name'].str.lower().str.contains(keyword, na=False))
+    
+    matched_entities = entities_df[mask]
+    
+    if len(matched_entities) > 0:
+        logger.info(f"找到 {len(matched_entities)} 个匹配 '{keyword}' 的实体")
+        return matched_entities.iloc[0]
+    else:
+        logger.warning(f"未找到匹配 '{keyword}' 的实体")
+        return None
+
+def get_entity_by_id(entities_df, entity_id, id_column='ID'):
+    """
+    根据ID从实体DataFrame中查找实体
+    
+    Parameters:
+    - entities_df: 实体DataFrame
+    - entity_id: 实体ID
+    - id_column: ID列名（默认为'ID'）
+    
+    Returns:
+    - 匹配的实体或None
+    """
+    matched_entities = entities_df[entities_df[id_column] == entity_id]
+    
+    if len(matched_entities) > 0:
+        return matched_entities.iloc[0]
+    else:
+        logger.warning(f"未找到ID为 '{entity_id}' 的实体")
+        return None
+core/relation_extractor.py
+python
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+关系提取模块
+提供从iKraph知识图谱中提取关系的功能
+"""
+
+import logging
+import pandas as pd
+from tqdm import tqdm
+import gc
+from typing import List, Dict, Tuple, Set, Union
+
+logger = logging.getLogger(__name__)
+
+def parse_relation_id(relation_id, relation_schema):
+    """Parse relation ID with enhanced error handling and type normalization"""
+    try:
+        if not relation_id or not isinstance(relation_id, str):
+            return None
+            
+        parts = relation_id.split(".")
+        if len(parts) >= 6:
+            source_id = parts[0]
+            target_id = parts[1]
+            relation_type_id = parts[2]
+            correlation_id = parts[3]
+            direction = parts[4]
+            source = ".".join(parts[5:])  # Combine remaining parts as source
+            
+            # Get relation type name with fallback
+            relation_type = "Unknown"
+            
+            # Try multiple ways to look up the relation type
+            if relation_schema:
+                # Try direct lookup
+                if relation_type_id in relation_schema:
+                    relation_type = relation_schema[relation_type_id]["name"]
+                # Try as integer
+                elif relation_type_id.isdigit() and int(relation_type_id) in relation_schema:
+                    relation_type = relation_schema[int(relation_type_id)]["name"]
+                # Try as string within a nested dictionary
+                else:
+                    for schema_id, schema_info in relation_schema.items():
+                        if str(schema_id) == relation_type_id:
+                            relation_type = schema_info["name"]
+                            break
+            
+            return {
+                "source_id": source_id,
+                "target_id": target_id,
+                "relation_type": relation_type,
+                "relation_type_id": relation_type_id,
+                "correlation_id": correlation_id,
+                "direction": direction,
+                "source": source
+            }
+        else:
+            return None
+    except Exception as e:
+        return None
+
+def extract_relations_with_entities(relations_data, entity_ids, relation_schema=None, min_confidence=0.0):
+    """
+    Extract relations connected to specific entities with multiple key strategies
+    
+    此函数增强了关系提取的灵活性和鲁棒性，支持多种数据结构和键名变体
+    
+    Parameters:
+    - relations_data: 关系数据（列表或字典）
+    - entity_ids: 目标实体ID列表
+    - relation_schema: 关系模式（可选）
+    - min_confidence: 最小置信度阈值
+    
+    Returns:
+    - 提取的关系列表
+    """
+    logger.info(f"提取涉及特定实体的关系: 实体数量={len(entity_ids)}")
+    
+    # 潜在的源ID和目标ID键名列表
+    source_id_keys = [
+        'Original Source ID', 'source_id', 'node_one_id', 
+        'sourceID', 'source', 'node1_id'
+    ]
+    target_id_keys = [
+        'Original Target ID', 'target_id', 'node_two_id', 
+        'targetID', 'target', 'node2_id'
+    ]
+    
+    # 创建实体ID集合用于快速查找
+    entity_id_set = set(entity_ids)
+    matched_relations = []
+    
+    # 记录未映射的关系类型ID，用于调试
+    unmapped_relation_types = set()
+    
+    # 处理列表格式的关系数据
+    if isinstance(relations_data, list):
+        total_relations = len(relations_data)
+        logger.info(f"处理列表格式的关系数据，总数: {total_relations}")
+        
+        for item in tqdm(relations_data, desc="处理关系列表", total=total_relations):
+            if not isinstance(item, dict):
+                continue
+            
+            # 灵活提取源ID和目标ID
+            source_id = next((item.get(key) for key in source_id_keys if item.get(key)), None)
+            target_id = next((item.get(key) for key in target_id_keys if item.get(key)), None)
+            
+            # 跳过缺少源或目标ID的关系
+            if not source_id or not target_id:
+                continue
+            
+            # 检查是否与目标实体相关
+            if source_id not in entity_id_set and target_id not in entity_id_set:
+                continue
+            
+            # 灵活提取关系类型
+            relation_type_keys = ['relationship_type', 'Relation Type', 'type', 'relation_type']
+            relation_type = next((item.get(key) for key in relation_type_keys if item.get(key)), "Unknown")
+            
+            # 灵活提取置信度和得分
+            confidence = float(next((item.get(key) for key in ['prob', 'confidence', 'Confidence'] if item.get(key) is not None), 0.0))
+            score = float(next((item.get(key) for key in ['score', 'Score'] if item.get(key) is not None), 0.0))
+            
+            # 应用置信度过滤
+            if min_confidence > 0 and confidence < min_confidence:
+                continue
+            
+            # 创建关系记录
+            relation = {
+                "Original Source ID": source_id,
+                "Original Target ID": target_id,
+                "Relation Type": relation_type,
+                "Confidence": confidence,
+                "Score": score,
+                "Source": item.get("source", "Database")
+            }
+            
+            # 尝试获取额外信息
+            if "novelty" in item:
+                relation["Novelty"] = item["novelty"]
+            
+            matched_relations.append(relation)
+            
+            # 记录未映射的关系类型
+            if relation_type == "Unknown":
+                unmapped_relation_types.add(str(item))
+    
+    # 处理字典格式的关系数据
+    elif isinstance(relations_data, dict):
+        total_relations = len(relations_data)
+        logger.info(f"处理字典格式的关系数据，总数: {total_relations}")
+        
+        for rel_id, rel_data in tqdm(relations_data.items(), desc="处理关系字典", total=total_relations):
+            if not isinstance(rel_data, dict):
+                continue
+            
+            # 灵活提取源ID和目标ID
+            source_id = next((rel_data.get(key) for key in source_id_keys if rel_data.get(key)), None)
+            target_id = next((rel_data.get(key) for key in target_id_keys if rel_data.get(key)), None)
+            
+            # 尝试从关系ID解析源和目标ID
+            if (not source_id or not target_id) and isinstance(rel_id, str):
+                parts = rel_id.split('.')
+                if len(parts) >= 2:
+                    source_id = parts[0]
+                    target_id = parts[1]
+            
+            # 跳过缺少源或目标ID的关系
+            if not source_id or not target_id:
+                continue
+            
+            # 检查是否与目标实体相关
+            if source_id not in entity_id_set and target_id not in entity_id_set:
+                continue
+            
+            # 灵活提取关系类型
+            relation_type_keys = ['relationship_type', 'Relation Type', 'type', 'relation_type']
+            relation_type = next((rel_data.get(key) for key in relation_type_keys if rel_data.get(key)), "Unknown")
+            
+            # 如果关系类型未找到，尝试从关系ID中提取
+            if relation_type == "Unknown" and isinstance(rel_id, str):
+                parts = rel_id.split('.')
+                if len(parts) >= 3:
+                    relation_type_id = parts[2]
+                    # 如果有关系模式，尝试查找关系类型
+                    if relation_schema and relation_type_id in relation_schema:
+                        relation_type = relation_schema[relation_type_id]["name"]
+            
+            # 灵活提取置信度和得分
+            confidence = float(next((rel_data.get(key) for key in ['prob', 'confidence', 'Confidence'] if rel_data.get(key) is not None), 0.0))
+            score = float(next((rel_data.get(key) for key in ['score', 'Score'] if rel_data.get(key) is not None), 0.0))
+            
+            # 应用置信度过滤
+            if min_confidence > 0 and confidence < min_confidence:
+                continue
+            
+            # 创建关系记录
+            relation = {
+                "Original Source ID": source_id,
+                "Original Target ID": target_id,
+                "Relation Type": relation_type,
+                "Confidence": confidence,
+                "Score": score,
+                "Source": rel_data.get("source", "Database")
+            }
+            
+            # 尝试获取额外信息
+            if "novelty" in rel_data:
+                relation["Novelty"] = rel_data["novelty"]
+            
+            matched_relations.append(relation)
+            
+            # 记录未映射的关系类型
+            if relation_type == "Unknown":
+                unmapped_relation_types.add(str(rel_data))
+    
+    else:
+        logger.error(f"不支持的关系数据类型: {type(relations_data)}")
+        return []
+    
+    # 报告未映射的关系类型
+    if unmapped_relation_types:
+        logger.warning(f"发现 {len(unmapped_relation_types)} 个未映射的关系类型示例: {list(unmapped_relation_types)[:10]}")
+    
+    logger.info(f"提取了 {len(matched_relations)} 条与目标实体相关的关系")
+    return matched_relations
+
+def extract_single_pubmed_relation_rapidjson(relation_item, relation_schema):
+    """Extract a single PubMed relation with enhanced error handling and relation type mapping"""
+    results = []
+    
+    try:
+        rel_id = relation_item.get("id")
+        rel_data = relation_item.get("list", [])
+        
+        # Validate relation ID
+        if not rel_id or not isinstance(rel_id, str):
+            return results
+            
+        # Parse relation ID
+        rel_components = parse_relation_id(rel_id, relation_schema)
+        if not rel_components:
+            return results
+        
+        # Get source and target IDs
+        source_id = rel_components["source_id"]
+        target_id = rel_components["target_id"]
+        
+        # Get relation type information
+        relation_type_id = rel_components["relation_type_id"]
+        relation_type = rel_components["relation_type"]
+        
+        # Process relation entries
+        for entry in rel_data:
+            if len(entry) >= 3:
+                try:
+                    # Extract data fields with better error handling
+                    score = float(entry[0]) if entry[0] and isinstance(entry[0], (int, float, str)) else 0.0
+                    document_id = str(entry[1]) if len(entry) > 1 and entry[1] else ""
+                    confidence = float(entry[2]) if len(entry) > 2 and entry[2] and isinstance(entry[2], (int, float, str)) else 0.0
+                    
+                    # Handle novelty with error checking
+                    novelty = None
+                    if len(entry) > 3 and entry[3] is not None:
+                        try:
+                            novelty = int(entry[3])
+                        except (ValueError, TypeError):
+                            pass
+                    
+                    # Create relation record
+                    relation = {
+                        "Original Source ID": source_id,
+                        "Original Target ID": target_id,
+                        "Relation Type": relation_type,
+                        "Relation Type ID": relation_type_id,
+                        "Confidence": confidence,
+                        "Score": score,
+                        "Document": document_id,
+                        "Novelty": novelty,
+                        "Source": "PubMed",
+                        "Direction": rel_components.get("direction", "forward")
+                    }
+                    
+                    results.append(relation)
+                    
+                except (ValueError, TypeError, IndexError):
+                    # Skip malformed entries
+                    continue
+    
+    except Exception as e:
+        # Log the error and return empty results
+        return []
+    
+    return results
+
+def extract_pubmed_relations(pubmed_data, entity_id_map, relation_schema, rel_type_map, min_confidence=0.0):
+    """提取PubMed关系数据，使用关系类型映射"""
+    logger.info("从PubMed数据中提取关系...")
+    relations = []
+    
+    # 记录未映射的关系类型ID，用于调试
+    unmapped_ids = set()
+    
+    # 处理基于数据类型
+    if isinstance(pubmed_data, list):
+        logger.info(f"PubMed数据是一个列表结构，包含 {len(pubmed_data)} 个元素")
+        
+        # 遍历所有PubMed关系
+        for item in tqdm(pubmed_data, desc="处理PubMed关系列表"):
+            # 提取关系ID和数据
+            if isinstance(item, dict) and "id" in item and "list" in item:
+                rel_id = item["id"]
+                rel_data = item["list"]
+                
+                # 解析关系ID
+                rel_components = parse_relation_id(rel_id, relation_schema)
+                if not rel_components:
+                    continue
+                
+                # 检查实体是否在我们的映射中
+                source_id = rel_components["source_id"]
+                target_id = rel_components["target_id"]
+                
+                if source_id not in entity_id_map or target_id not in entity_id_map:
+                    continue
+                
+                # 提取关系类型和关系类型ID
+                relation_type_id = rel_components["relation_type_id"]
+                
+                # 尝试多种方式查找关系类型名称
+                relation_type = None
+                
+                # 1. 直接从rel_type_map查找字符串ID
+                if relation_type_id in rel_type_map:
+                    relation_type = rel_type_map[relation_type_id]
+                # 2. 尝试将ID转换为整数再查找
+                elif relation_type_id.isdigit() and int(relation_type_id) in rel_type_map:
+                    relation_type = rel_type_map[int(relation_type_id)]
+                # 3. 如果上述方法都失败，使用解析出的关系类型
+                else:
+                    relation_type = rel_components["relation_type"]
+                    # 记录未映射到的ID
+                    unmapped_ids.add(relation_type_id)
+                
+                # 处理所有此关系的条目
+                for entry in rel_data:
+                    if len(entry) >= 3:  # 确保有足够的元素
+                        # 创建关系记录
+                        relation = {
+                            "Source ID": entity_id_map[source_id],
+                            "Target ID": entity_id_map[target_id],
+                            "Relation Type": relation_type,
+                            "Relation Type ID": relation_type_id,  # 保留ID以便参考
+                            "Confidence": float(entry[2]) if len(entry) > 2 and entry[2] else 0.0,
+                            "Score": float(entry[0]) if entry[0] else 0.0,
+                            "Document": entry[1] if len(entry) > 1 else "",
+                            "Novelty": int(entry[3]) if len(entry) > 3 and entry[3] is not None else None,
+                            "Source": "PubMed",
+                            "Original Source ID": source_id,
+                            "Original Target ID": target_id,
+                            "Direction": rel_components["direction"]
+                        }
+                        
+                        # 应用置信度过滤
+                        if min_confidence > 0 and relation["Confidence"] < min_confidence:
+                            continue
+                            
+                        relations.append(relation)
+    
+    elif isinstance(pubmed_data, dict):
+        logger.info("PubMed数据是一个字典结构")
+        # 遍历所有PubMed关系
+        for rel_id, rel_data in tqdm(pubmed_data.items(), desc="处理PubMed关系"):
+            # 解析关系ID
+            rel_components = parse_relation_id(rel_id, relation_schema)
+            if not rel_components:
+                continue
+            
+            # 检查实体是否在我们的映射中
+            source_id = rel_components["source_id"]
+            target_id = rel_components["target_id"]
+            
+            if source_id not in entity_id_map or target_id not in entity_id_map:
+                continue
+            
+            # 提取关系类型和关系类型ID
+            relation_type_id = rel_components["relation_type_id"]
+            
+            # 尝试多种方式查找关系类型名称
+            relation_type = None
+            
+            # 1. 直接从rel_type_map查找字符串ID
+            if relation_type_id in rel_type_map:
+                relation_type = rel_type_map[relation_type_id]
+            # 2. 尝试将ID转换为整数再查找
+            elif relation_type_id.isdigit() and int(relation_type_id) in rel_type_map:
+                relation_type = rel_type_map[int(relation_type_id)]
+            # 3. 如果上述方法都失败，使用解析出的关系类型
+            else:
+                relation_type = rel_components["relation_type"]
+                # 记录未映射到的ID
+                unmapped_ids.add(relation_type_id)
+            
+            # 处理所有此关系的条目
+            for entry in rel_data.get("list", []):
+                if len(entry) >= 3:  # 确保有足够的元素
+                    score = float(entry[0]) if entry[0] else 0.0
+                    document_id = entry[1] if len(entry) > 1 else ""
+                    confidence = float(entry[2]) if len(entry) > 2 and entry[2] else 0.0
+                    novelty = int(entry[3]) if len(entry) > 3 and entry[3] is not None else None
+                    
+                    # 仅当设置了min_confidence时才应用置信度过滤
+                    if min_confidence > 0 and confidence < min_confidence:
+                        continue
+                    
+                    # 创建关系记录
+                    relation = {
+                        "Source ID": entity_id_map[source_id],
+                        "Target ID": entity_id_map[target_id],
+                        "Relation Type": relation_type,
+                        "Relation Type ID": relation_type_id,
+                        "Confidence": confidence,
+                        "Score": score,
+                        "Document": document_id,
+                        "Novelty": novelty,
+                        "Source": "PubMed",
+                        "Original Source ID": source_id,
+                        "Original Target ID": target_id,
+                        "Direction": rel_components["direction"]
+                    }
+                    
+                    relations.append(relation)
+    else:
+        logger.error(f"不支持的PubMed数据类型: {type(pubmed_data)}")
+    
+    # 报告未映射的关系类型ID
+    if unmapped_ids:
+        logger.warning(f"发现 {len(unmapped_ids)} 个未映射的关系类型ID: {', '.join(list(unmapped_ids)[:10])}" + 
+                      (f"... 等" if len(unmapped_ids) > 10 else ""))
+    
+    logger.info(f"从PubMed数据中提取了 {len(relations)} 条关系")
+    return relations
+
+def extract_db_relations(db_data, entity_id_map, relation_schema, rel_type_map, min_confidence=0.0):
+    """从数据库关系中提取关系，使用关系类型映射"""
+    logger.info("从数据库数据中提取关系...")
+    relations = []
+    
+    # 记录未映射的关系类型ID，用于调试
+    unmapped_ids = set()
+    
+    # 确认数据类型并适当处理
+    if isinstance(db_data, list):
+        logger.info(f"数据库关系是一个列表结构，包含 {len(db_data)} 个元素")
+        
+        # 遍历所有数据库关系
+        for item in tqdm(db_data, desc="处理数据库关系列表"):
+            if not isinstance(item, dict):
+                continue
+                
+            # 获取源和目标ID
+            source_id = item.get("node_one_id")
+            target_id = item.get("node_two_id")
+            
+            # 检查实体是否在我们的映射中
+            if not source_id or not target_id:
+                continue
+            
+            if source_id not in entity_id_map or target_id not in entity_id_map:
+                continue
+            
+            # 提取关系属性
+            relation_type_raw = item.get("relationship_type", "Unknown")
+            
+            # 尝试多种方式查找关系类型名称
+            relation_type = None
+            
+            # 检查关系类型是否为数字（ID）
+            if relation_type_raw.isdigit():
+                # 1. 直接从rel_type_map查找字符串ID
+                if relation_type_raw in rel_type_map:
+                    relation_type = rel_type_map[relation_type_raw]
+                # 2. 尝试将ID转换为整数再查找
+                elif int(relation_type_raw) in rel_type_map:
+                    relation_type = rel_type_map[int(relation_type_raw)]
+                else:
+                    relation_type = "Unknown"
+                    # 记录未映射到的ID
+                    unmapped_ids.add(relation_type_raw)
+            else:
+                relation_type = relation_type_raw
+            
+            # 获取置信度和得分
+            confidence = float(item.get("prob", 0.0)) if item.get("prob") else 0.0
+            score = float(item.get("score", 0.0)) if item.get("score") else 0.0
+            
+            # 应用置信度过滤
+            if min_confidence > 0 and confidence < min_confidence:
+                continue
+            
+            # 创建关系记录
+            relation = {
+                "Source ID": entity_id_map[source_id],
+                "Target ID": entity_id_map[target_id],
+                "Relation Type": relation_type,
+                "Relation Type ID": relation_type_raw if relation_type_raw.isdigit() else "",
+                "Confidence": confidence,
+                "Score": score,
+                "Source": item.get("source", "Database"),
+                "Original Source ID": source_id,
+                "Original Target ID": target_id
+            }
+            
+            relations.append(relation)
+    
+    elif isinstance(db_data, dict):
+        logger.info("数据库关系是一个字典结构")
+        # 遍历所有数据库关系
+        for rel_id, rel_data in tqdm(db_data.items(), desc="处理数据库关系"):
+            # 获取源和目标ID
+            source_id = rel_data.get("node_one_id")
+            target_id = rel_data.get("node_two_id")
+            
+            # 如果IDs没有在rel_data中，尝试从rel_id提取
+            if (not source_id or not target_id) and isinstance(rel_id, str):
+                parts = rel_id.split('.')
+                if len(parts) >= 2:
+                    source_id = parts[0]
+                    target_id = parts[1]
+            
+            # 检查实体是否在我们的映射中
+            if not source_id or not target_id:
+                continue
+            
+            if source_id not in entity_id_map or target_id not in entity_id_map:
+                continue
+            
+            # 提取关系属性
+            relation_type_raw = rel_data.get("relationship_type", "Unknown")
+            
+            # 如果关系类型未找到，尝试从rel_id中提取
+            if relation_type_raw == "Unknown" and isinstance(rel_id, str):
+                parts = rel_id.split('.')
+                if len(parts) >= 3:
+                    relation_type_id = parts[2]
+                    if relation_type_id.isdigit():
+                        relation_type_raw = relation_type_id
+            
+            # 尝试多种方式查找关系类型名称
+            relation_type = None
+            
+            # 检查关系类型是否为数字（ID）
+            if isinstance(relation_type_raw, str) and relation_type_raw.isdigit():
+                # 1. 直接从rel_type_map查找字符串ID
+                if relation_type_raw in rel_type_map:
+                    relation_type = rel_type_map[relation_type_raw]
+                # 2. 尝试将ID转换为整数再查找
+                elif int(relation_type_raw) in rel_type_map:
+                    relation_type = rel_type_map[int(relation_type_raw)]
+                else:
+                    relation_type = "Unknown"
+                    # 记录未映射到的ID
+                    unmapped_ids.add(relation_type_raw)
+            else:
+                relation_type = relation_type_raw
+            
+            # 获取置信度和得分
+            confidence = float(rel_data.get("prob", 0.0)) if rel_data.get("prob") else 0.0
+            score = float(rel_data.get("score", 0.0)) if rel_data.get("score") else 0.0
+            
+            # 应用置信度过滤
+            if min_confidence > 0 and confidence < min_confidence:
+                continue
+            
+            # 创建关系记录
+            relation = {
+                "Source ID": entity_id_map[source_id],
+                "Target ID": entity_id_map[target_id],
+                "Relation Type": relation_type,
+                "Relation Type ID": relation_type_raw if isinstance(relation_type_raw, str) and relation_type_raw.isdigit() else "",
+                "Confidence": confidence,
+                "Score": score,
+                "Source": rel_data.get("source", "Database"),
+                "Original Source ID": source_id,
+                "Original Target ID": target_id
+            }
+            
+            relations.append(relation)
+    else:
+        logger.error(f"不支持的数据库关系数据类型: {type(db_data)}")
+    
+    # 报告未映射的关系类型ID
+    if unmapped_ids:
+        logger.warning(f"发现 {len(unmapped_ids)} 个未映射的关系类型ID: {', '.join(list(unmapped_ids)[:10])}" + 
+                      (f"... 等" if len(unmapped_ids) > 10 else ""))
+    
+    logger.info(f"从数据库关系中提取了 {len(relations)} 个关系")
+    return relations
+
+def add_entity_names_to_relations(relations, entities_df):
+    """向关系添加实体名称，优先使用通用名称，清理中文字符但保留希腊字母"""
+    logger.info("向关系添加实体名称...")
+    
+    # 创建ID到名称的映射
+    id_to_official_name = dict(zip(entities_df["ID"], entities_df["Official_Name"]))
+    id_to_common_name = dict(zip(entities_df["ID"], entities_df["Common_Name"]))
+    id_to_type = dict(zip(entities_df["ID"], entities_df["Type"]))
+    
+    # 添加名称和类型到关系
+    for relation in tqdm(relations, desc="向关系添加实体名称"):
+        source_id = relation["Source ID"]
+        target_id = relation["Target ID"]
+        
+        # 优先使用通用名称，如果没有则使用官方名称
+        source_common = id_to_common_name.get(source_id, "")
+        source_official = id_to_official_name.get(source_id, "")
+        target_common = id_to_common_name.get(target_id, "")
+        target_official = id_to_official_name.get(target_id, "")
+        
+        # 使用清理函数处理名称，保留希腊字母
+        relation["Source Name"] = source_common if source_common else source_official
+        relation["Source Official Name"] = source_official
+        relation["Target Name"] = target_common if target_common else target_official
+        relation["Target Official Name"] = target_official
+        relation["Source Type"] = id_to_type.get(source_id, "Unknown")
+        relation["Target Type"] = id_to_type.get(target_id, "Unknown")
+    
+    return relations
+
+def update_relation_entity_ids(relations, entity_id_map):
+    """更新关系的实体ID映射"""
+    updated_relations = []
+    
+    for relation in tqdm(relations, desc="更新关系实体ID"):
+        # 获取原始ID
+        source_id = relation.get("Original Source ID")
+        target_id = relation.get("Original Target ID")
+        
+        # 检查ID是否在映射中
+        if source_id in entity_id_map and target_id in entity_id_map:
+            # 更新ID
+            updated_relation = relation.copy()
+            updated_relation["Source ID"] = entity_id_map[source_id]
+            updated_relation["Target ID"] = entity_id_map[target_id]
+            updated_relations.append(updated_relation)
+    
+    logger.info(f"更新了 {len(updated_relations)} 条关系的实体ID")
+    return updated_relations
+
+def merge_duplicate_relations(relations):
+    """
+    根据iKraph结构合并重复的关系记录，忽略大小写差异
+    """
+    logger.info("正在合并重复的关系记录...")
+    
+    # 记录合并前的关系数量
+    original_count = len(relations)
+    
+    # 用于标识唯一关系的键（标准化源ID、目标ID和关系类型，包括大小写处理）
+    grouped_relations = {}
+    
+    # 按源实体、目标实体和关系类型分组
+    for relation in tqdm(relations, desc="合并重复关系"):
+        # 转换关系类型为小写以忽略大小写差异
+        rel_type = relation.get("Relation Type", "")
+        rel_type_lower = rel_type.lower() if isinstance(rel_type, str) else rel_type
+        
+        key = (relation.get("Original Source ID", ""), 
+               relation.get("Original Target ID", ""), 
+               rel_type_lower)  # 关系类型转为小写
+        
+        # 跳过缺少关键数据的关系
+        if not all(key):
+            continue
+            
+        if key not in grouped_relations:
+            # 第一次遇到此关系，创建新记录
+            base_record = {k: v for k, v in relation.items() 
+                          if k not in ["Document", "Score", "Confidence", "Novelty"]}
+            
+            # 保留原始大小写格式的关系类型
+            base_record["Original_Relation_Type"] = rel_type
+            base_record["Evidence"] = []
+            base_record["Max_Confidence"] = 0
+            base_record["Avg_Confidence"] = 0
+            base_record["Evidence_Count"] = 0
+            grouped_relations[key] = base_record
+        else:
+            # 如果当前关系类型有更好的格式（比如首字母大写而不是全大写或全小写）
+            current_rel_type = relation.get("Relation Type", "")
+            if isinstance(current_rel_type, str):
+                curr_lower = current_rel_type.lower()
+                curr_upper = current_rel_type.upper()
+                
+                # 检查当前值是否比保存值更合适（首字母大写优于全大写或全小写）
+                if current_rel_type != curr_lower and current_rel_type != curr_upper:
+                    grouped_relations[key]["Original_Relation_Type"] = current_rel_type
+        
+        # 添加证据
+        evidence = {
+            "Document": relation.get("Document", ""),
+            "Score": relation.get("Score", 0),
+            "Confidence": relation.get("Confidence", 0),
+            "Novelty": relation.get("Novelty", None)
+        }
+        
+        # 更新聚合统计
+        conf = float(evidence["Confidence"]) if evidence["Confidence"] else 0
+        grouped_relations[key]["Evidence"].append(evidence)
+        grouped_relations[key]["Evidence_Count"] += 1
+        grouped_relations[key]["Max_Confidence"] = max(grouped_relations[key]["Max_Confidence"], conf)
+        
+        # 更新平均置信度
+        total = grouped_relations[key]["Avg_Confidence"] * (grouped_relations[key]["Evidence_Count"] - 1)
+        grouped_relations[key]["Avg_Confidence"] = (total + conf) / grouped_relations[key]["Evidence_Count"]
+    
+    # 转换回列表并格式化输出
+    result = []
+    for key, rel_data in grouped_relations.items():
+        # 选择最高置信度的证据作为主要显示
+        best_evidence = max(rel_data["Evidence"], 
+                           key=lambda e: e["Confidence"] if e["Confidence"] else 0) if rel_data["Evidence"] else {}
+        
+        # 创建输出记录
+        output_record = {k: v for k, v in rel_data.items() 
+                        if k not in ["Evidence", "Avg_Confidence"]}
+        
+        # 使用更好格式的关系类型
+        if "Original_Relation_Type" in output_record:
+            output_record["Relation Type"] = output_record["Original_Relation_Type"]
+            del output_record["Original_Relation_Type"]
+        
+        # 添加主要证据信息
+        output_record["Confidence"] = rel_data["Max_Confidence"]
+        output_record["Score"] = best_evidence.get("Score", 0)
+        output_record["Document"] = best_evidence.get("Document", "")
+        if "Novelty" in best_evidence and best_evidence["Novelty"] is not None:
+            output_record["Novelty"] = best_evidence["Novelty"]
+        
+        # 添加证据摘要信息
+        output_record["Evidence_Summary"] = f"{rel_data['Evidence_Count']} references"
+        if rel_data["Evidence_Count"] > 1:
+            output_record["Other_Documents"] = "|".join(str(e.get("Document", "")) 
+                                                      for e in rel_data["Evidence"][:5] 
+                                                      if e.get("Document") != output_record["Document"])
+            if len(rel_data["Evidence"]) > 5:
+                output_record["Other_Documents"] += f"... (+{len(rel_data['Evidence'])-5} more)"
+        
+        result.append(output_record)
+    
+    logger.info(f"合并完成：从 {original_count} 条关系记录合并为 {len(result)} 条")
+    return result
+
+def extract_relations_with_direction(relations_data, entity_ids, relation_schema, rel_type_map=None, min_confidence=0.0):
+    """
+    提取带有方向信息的关系
+    
+    Parameters:
+    - relations_data: 关系数据
+    - entity_ids: 实体ID列表
+    - relation_schema: 关系模式，用于确定关系方向
+    - rel_type_map: 关系类型映射
+    - min_confidence: 最小置信度
+    
+    Returns:
+    - 带有方向信息的关系列表
+    """
+    # 首先提取关系
+    relations = extract_relations_with_entities(relations_data, entity_ids, relation_schema, min_confidence)
+    
+    # 添加方向信息
+    for relation in relations:
+        relation_type_id = relation.get("Relation Type ID", "")
+        if not relation_type_id and "Relation Type" in relation:
+            # 尝试根据关系类型名称反向查找ID
+            if rel_type_map:
+                for rid, rname in rel_type_map.items():
+                    if rname == relation["Relation Type"]:
+                        relation_type_id = rid
+                        relation["Relation Type ID"] = rid
+                        break
+        
+        # 设置方向
+        if relation_type_id and relation_type_id in relation_schema:
+            relation["Direction"] = relation_schema[relation_type_id].get("direction", 0)
+        elif "Relation Type" in relation:
+            # 根据关系类型名称确定方向
+            rel_type = relation["Relation Type"].lower()
+            if "positive" in rel_type or "activates" in rel_type or "increases" in rel_type:
+                relation["Direction"] = 1
+            elif "negative" in rel_type or "inhibits" in rel_type or "decreases" in rel_type:
+                relation["Direction"] = -1
+            else:
+                relation["Direction"] = 0
+    
+    return relations
+
+def filter_relations_by_type(relations, relation_types):
+    """
+    按关系类型过滤关系
+    
+    Parameters:
+    - relations: 关系列表
+    - relation_types: 关系类型列表
+    
+    Returns:
+    - 过滤后的关系列表
+    """
+    if not relation_types:
+        return relations
+    
+    filtered = []
+    relation_type_set = set(relation_types)
+    
+    for relation in relations:
+        rel_type = relation.get("Relation Type")
+        rel_type_id = relation.get("Relation Type ID")
+        
+        if rel_type in relation_type_set or rel_type_id in relation_type_set:
+            filtered.append(relation)
+    
+    logger.info(f"按关系类型过滤: 从 {len(relations)} 条关系中筛选出 {len(filtered)} 条")
+    return filtered
+
+def filter_relations_by_entity_types(relations, entity_type_pairs):
+    """
+    按实体类型对过滤关系
+    
+    Parameters:
+    - relations: 关系列表
+    - entity_type_pairs: 实体类型对列表，如[("Drug", "Gene"), ("Gene", "Disease")]
+    
+    Returns:
+    - 过滤后的关系列表
+    """
+    if not entity_type_pairs:
+        return relations
+    
+    filtered = []
+    
+    for relation in relations:
+        source_type = relation.get("Source Type")
+        target_type = relation.get("Target Type")
+        
+        if (source_type, target_type) in entity_type_pairs or (target_type, source_type) in entity_type_pairs:
+            filtered.append(relation)
+    
+    logger.info(f"按实体类型对过滤: 从 {len(relations)} 条关系中筛选出 {len(filtered)} 条")
+    return filtered
+core/graph_builder.py
+python
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+图构建模块
+提供构建和操作网络图的功能
+"""
+
+import os
+import logging
+import pandas as pd
+import numpy as np
+import networkx as nx
+from tqdm import tqdm
+import random
+from typing import List, Dict, Tuple, Set, Union, Optional
+
+logger = logging.getLogger(__name__)
+
+def build_networkx_graph(entities, relations, include_attributes=True):
+    """
+    构建NetworkX图
+    
+    Parameters:
+    - entities: 实体列表或DataFrame
+    - relations: 关系列表或DataFrame
+    - include_attributes: 是否包含所有属性
+    
+    Returns:
+    - NetworkX DiGraph
+    """
+    logger.info("构建NetworkX图...")
+    
+    # 创建有向图
+    G = nx.DiGraph()
+    
+    # 转换为DataFrame（如果是列表）
+    if isinstance(entities, list):
+        entities_df = pd.DataFrame(entities)
+    else:
+        entities_df = entities
+    
+    if isinstance(relations, list):
+        relations_df = pd.DataFrame(relations)
+    else:
+        relations_df = relations
+    
+    # 添加节点
+    for _, entity in tqdm(entities_df.iterrows(), desc="添加节点", total=len(entities_df)):
+        # 节点ID使用ID字段
+        node_id = str(entity['ID'])
+        
+        # 创建节点属性字典
+        attrs = {}
+        if include_attributes:
+            # 包含所有实体属性
+            for col in entities_df.columns:
+                if col != 'ID':
+                    attrs[col] = entity[col]
+        else:
+            # 仅包含基本属性
+            attrs = {
+                'name': entity.get('Name', ''),
+                'type': entity.get('Type', ''),
+                'is_keyword': entity.get('Is Keyword', False)
+            }
+        
+        # 添加节点
+        G.add_node(node_id, **attrs)
+    
+    # 添加边
+    for _,
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Let me complete the remaining code for the iKraph Drug Synergy Analysis System:
+
+core/graph_builder.py (continued)
+python
+    # 添加边
+    for _, relation in tqdm(relations_df.iterrows(), desc="添加边", total=len(relations_df)):
+        # 获取源节点和目标节点ID
+        source_id = str(relation['Source ID'])
+        target_id = str(relation['Target ID'])
+        
+        # 跳过源或目标不在图中的关系
+        if source_id not in G.nodes or target_id not in G.nodes:
+            continue
+        
+        # 创建边属性字典
+        edge_attrs = {}
+        if include_attributes:
+            # 包含所有关系属性（除了源和目标ID）
+            for col in relations_df.columns:
+                if col not in ['Source ID', 'Target ID']:
+                    edge_attrs[col] = relation[col]
+        else:
+            # 仅包含基本属性
+            edge_attrs = {
+                'relation_type': relation.get('Relation Type', 'Unknown'),
+                'confidence': float(relation.get('Confidence', 0.5)),
+                'direction': relation.get('Direction', 0)
+            }
+        
+        # 添加边
+        G.add_edge(source_id, target_id, **edge_attrs)
+    
+    logger.info(f"构建了包含 {len(G.nodes)} 个节点和 {len(G.edges)} 条边的图")
+    return G
+
+def create_visualization_subgraph(G, focal_nodes, max_nodes=1000):
+    """创建更健壮的可视化子图，确保包含关键节点和连接"""
+    logger.info(f"创建可视化子图，总节点数: {len(G.nodes)}")
+    
+    # 始终保留关键词实体节点
+    nodes_to_keep = set(focal_nodes)
+    logger.info(f"关键词节点数: {len(nodes_to_keep)}")
+    
+    # 如果关键词节点为空，退出
+    if not nodes_to_keep:
+        logger.warning("未找到关键词节点，尝试包含所有节点")
+        # 取前max_nodes个节点作为备选
+        all_nodes = list(G.nodes)
+        nodes_to_keep = set(all_nodes[:min(max_nodes, len(all_nodes))])
+    
+    # 添加与关键词节点直接相连的邻居节点
+    neighbors = set()
+    for node in nodes_to_keep:
+        if node in G:  # 确保节点存在于图中
+            neighbors.update(G.neighbors(node))
+    logger.info(f"发现的邻居节点数: {len(neighbors)}")
+    
+    # 从邻居中选择要保留的节点
+    remaining_slots = max_nodes - len(nodes_to_keep)
+    if remaining_slots > 0 and neighbors:
+        # 按度排序邻居节点（连接数多的优先）
+        neighbor_degrees = [(n, G.degree(n)) for n in neighbors if n not in nodes_to_keep]
+        neighbor_degrees.sort(key=lambda x: x[1], reverse=True)
+        
+        # 添加高度邻居
+        top_neighbors = [n for n, _ in neighbor_degrees[:remaining_slots]]
+        nodes_to_keep.update(top_neighbors)
+    
+    # 创建子图
+    subgraph = G.subgraph(nodes_to_keep)
+    logger.info(f"创建的可视化子图包含 {len(subgraph.nodes)} 个节点和 {len(subgraph.edges)} 条边")
+    
+    # 如果子图为空，尝试更宽松的方法
+    if len(subgraph.nodes) == 0:
+        logger.warning("可视化子图为空，尝试更宽松的选择方法")
+        # 简单地选取前max_nodes个节点
+        all_nodes = list(G.nodes)
+        sample_size = min(max_nodes, len(all_nodes))
+        subgraph = G.subgraph(all_nodes[:sample_size])
+        logger.info(f"备选方法创建的可视化子图包含 {len(subgraph.nodes)} 个节点和 {len(subgraph.edges)} 条边")
+    
+    return subgraph
+
+def create_drug_synergy_subgraph(G, drug1_id, drug2_id, disease_id, max_intermediate_nodes=50):
+    """
+    创建药物协同作用子图，重点包含两种药物的共同靶点和通向疾病的路径
+    
+    Parameters:
+    - G: 原始NetworkX图
+    - drug1_id: 第一种药物ID
+    - drug2_id: 第二种药物ID
+    - disease_id: 疾病ID
+    - max_intermediate_nodes: 最大中间节点数量
+    
+    Returns:
+    - 协同作用子图
+    """
+    logger.info(f"创建药物协同子图: 药物1={drug1_id}, 药物2={drug2_id}, 疾病={disease_id}")
+    
+    # 必须保留的节点
+    nodes_to_keep = {drug1_id, drug2_id, disease_id}
+    
+    # 获取药物1的邻居
+    drug1_neighbors = set(G.neighbors(drug1_id)) if drug1_id in G else set()
+    
+    # 获取药物2的邻居
+    drug2_neighbors = set(G.neighbors(drug2_id)) if drug2_id in G else set()
+    
+    # 获取共同邻居（共同靶点）
+    common_neighbors = drug1_neighbors.intersection(drug2_neighbors)
+    logger.info(f"发现 {len(common_neighbors)} 个共同靶点")
+    
+    # 添加共同靶点
+    nodes_to_keep.update(common_neighbors)
+    
+    # 查找从共同靶点到疾病的最短路径
+    paths_to_disease = []
+    for node in common_neighbors:
+        try:
+            if nx.has_path(G, node, disease_id):
+                path = nx.shortest_path(G, node, disease_id)
+                paths_to_disease.append(path)
+        except nx.NetworkXError:
+            continue
+    
+    # 添加路径中的所有节点
+    for path in paths_to_disease:
+        nodes_to_keep.update(path)
+    
+    # 如果共同靶点少于阈值，添加各自的一些靶点
+    if len(common_neighbors) < 5:
+        # 按关系强度排序药物1的靶点
+        drug1_targets = []
+        for target in drug1_neighbors:
+            if target in G[drug1_id]:
+                confidence = G[drug1_id][target].get('confidence', 0)
+                drug1_targets.append((target, confidence))
+        
+        drug1_targets.sort(key=lambda x: x[1], reverse=True)
+        
+        # 按关系强度排序药物2的靶点
+        drug2_targets = []
+        for target in drug2_neighbors:
+            if target in G[drug2_id]:
+                confidence = G[drug2_id][target].get('confidence', 0)
+                drug2_targets.append((target, confidence))
+        
+        drug2_targets.sort(key=lambda x: x[1], reverse=True)
+        
+        # 添加一些重要靶点
+        top_targets_to_add = min(10, max_intermediate_nodes // 2)
+        for target, _ in drug1_targets[:top_targets_to_add]:
+            nodes_to_keep.add(target)
+        
+        for target, _ in drug2_targets[:top_targets_to_add]:
+            nodes_to_keep.add(target)
+    
+    # 限制总节点数
+    if len(nodes_to_keep) > max_intermediate_nodes + 3:  # +3 for the drugs and disease
+        # 确保药物和疾病节点保留
+        essential_nodes = {drug1_id, drug2_id, disease_id}
+        other_nodes = list(nodes_to_keep - essential_nodes)
+        
+        # 随机选择其他节点
+        selected_others = random.sample(other_nodes, max_intermediate_nodes)
+        nodes_to_keep = set(essential_nodes).union(selected_others)
+    
+    # 创建子图
+    subgraph = G.subgraph(nodes_to_keep)
+    logger.info(f"创建的药物协同子图包含 {len(subgraph.nodes)} 个节点和 {len(subgraph.edges)} 条边")
+    
+    return subgraph
+
+def find_paths_between(G, source_id, target_id, max_length=2):
+    """
+    查找两个节点之间的所有路径（长度限制）
+    
+    Parameters:
+    - G: NetworkX图
+    - source_id: 源节点ID
+    - target_id: 目标节点ID
+    - max_length: 最大路径长度
+    
+    Returns:
+    - 路径列表
+    """
+    if source_id not in G or target_id not in G:
+        logger.warning(f"源节点 {source_id} 或目标节点 {target_id} 不在图中")
+        return []
+    
+    try:
+        # 使用simple_paths查找所有路径
+        paths = list(nx.all_simple_paths(G, source_id, target_id, cutoff=max_length))
+        logger.info(f"找到 {len(paths)} 条从 {source_id} 到 {target_id} 的路径（最大长度={max_length}）")
+        return paths
+    except nx.NetworkXError as e:
+        logger.error(f"查找路径时出错: {e}")
+        return []
+
+def get_node_neighbors_by_type(G, node_id, neighbor_types=None, edge_types=None):
+    """
+    获取特定类型的邻居节点
+    
+    Parameters:
+    - G: NetworkX图
+    - node_id: 节点ID
+    - neighbor_types: 邻居类型列表
+    - edge_types: 边类型列表
+    
+    Returns:
+    - 满足条件的邻居节点列表
+    """
+    if node_id not in G:
+        logger.warning(f"节点 {node_id} 不在图中")
+        return []
+    
+    neighbors = []
+    
+    for neighbor in G.neighbors(node_id):
+        # 检查邻居类型
+        if neighbor_types and G.nodes[neighbor].get('type') not in neighbor_types:
+            continue
+        
+        # 检查边类型
+        if edge_types and G[node_id][neighbor].get('relation_type') not in edge_types:
+            continue
+        
+        neighbors.append(neighbor)
+    
+    return neighbors
+
+def find_common_neighbors(G, node1_id, node2_id, neighbor_types=None):
+    """
+    查找两个节点的共同邻居
+    
+    Parameters:
+    - G: NetworkX图
+    - node1_id: 第一个节点ID
+    - node2_id: 第二个节点ID
+    - neighbor_types: 邻居类型列表（可选）
+    
+    Returns:
+    - 共同邻居列表
+    """
+    if node1_id not in G or node2_id not in G:
+        logger.warning(f"节点 {node1_id} 或 {node2_id} 不在图中")
+        return []
+    
+    # 获取两个节点的所有邻居
+    node1_neighbors = set(G.neighbors(node1_id))
+    node2_neighbors = set(G.neighbors(node2_id))
+    
+    # 计算交集
+    common = node1_neighbors.intersection(node2_neighbors)
+    
+    # 按类型过滤（如果指定）
+    if neighbor_types:
+        common = {n for n in common if G.nodes[n].get('type') in neighbor_types}
+    
+    return list(common)
+analysis/__init__.py
+python
+# 空文件，使analysis成为一个包
+analysis/psr_engine.py
+python
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+概率语义推理（PSR）引擎
+实现基于概率的语义推理算法，用于间接关系推断
+"""
+
+import logging
+import numpy as np
+from tqdm import tqdm
+import networkx as nx
+from typing import List, Dict, Tuple, Set, Union, Optional
+
+logger = logging.getLogger(__name__)
+
+class PSREngine:
+    """概率语义推理引擎"""
+    
+    def __init__(self, graph=None, relation_schema=None):
+        """
+        初始化PSR引擎
+        
+        Parameters:
+        - graph: NetworkX图对象（可选）
+        - relation_schema: 关系模式（可选）
+        """
+        self.graph = graph
+        self.relation_schema = relation_schema
+        
+        # 直接关系概率缓存
+        self.direct_prob_cache = {}
+        
+        # 间接关系概率缓存
+        self.indirect_prob_cache = {}
+    
+    def set_graph(self, graph):
+        """设置图对象"""
+        self.graph = graph
+        # 清除缓存
+        self.direct_prob_cache = {}
+        self.indirect_prob_cache = {}
+    
+    def set_relation_schema(self, relation_schema):
+        """设置关系模式"""
+        self.relation_schema = relation_schema
+    
+    def calculate_direct_probability(self, source_id, target_id, relation_type=None):
+        """
+        计算两个实体之间的直接关系概率
+        
+        基于公式:
+        P_{A→B} = 1 - ∏_{i=1}^{N}(1 - p^i_{A→B})
+        
+        Parameters:
+        - source_id: 源实体ID
+        - target_id: 目标实体ID
+        - relation_type: 关系类型（可选）
+        
+        Returns:
+        - 直接关系的概率
+        """
+        # 检查缓存
+        cache_key = (source_id, target_id, relation_type)
+        if cache_key in self.direct_prob_cache:
+            return self.direct_prob_cache[cache_key]
+        
+        if self.graph is None:
+            logger.error("图对象未设置")
+            return 0.0
+        
+        # 检查节点是否存在
+        if source_id not in self.graph or target_id not in self.graph:
+            return 0.0
+        
+        # 检查边是否存在
+        if not self.graph.has_edge(source_id, target_id):
+            return 0.0
+        
+        # 获取边属性
+        edge_data = self.graph[source_id][target_id]
+        
+        # 如果指定了关系类型，检查是否匹配
+        if relation_type and edge_data.get('relation_type') != relation_type:
+            return 0.0
+        
+        # 获取置信度
+        confidence = edge_data.get('confidence', 0.0)
+        if not confidence:
+            # 尝试获取其他概率相关字段
+            confidence = edge_data.get('probability', edge_data.get('weight', 0.5))
+        
+        # 储存到缓存
+        self.direct_prob_cache[cache_key] = float(confidence)
+        
+        return float(confidence)
+    
+    def calculate_indirect_probability(self, source_id, target_id, via_node_id, relation_types=None):
+        """
+        计算通过中间节点的间接关系概率
+        
+        基于公式:
+        P_{A→C via B} = P_{A→B} × P_{B→C}
+        
+        Parameters:
+        - source_id: 源实体ID
+        - target_id: 目标实体ID
+        - via_node_id: 中间节点ID
+        - relation_types: 关系类型列表（可选）
+        
+        Returns:
+        - 间接关系的概率
+        """
+        # 计算 A→B 的概率
+        p_a_b = self.calculate_direct_probability(source_id, via_node_id, 
+                                                relation_types[0] if relation_types and len(relation_types) > 0 else None)
+        
+        # 计算 B→C 的概率
+        p_b_c = self.calculate_direct_probability(via_node_id, target_id,
+                                                relation_types[1] if relation_types and len(relation_types) > 1 else None)
+        
+        # 计算间接关系概率
+        return p_a_b * p_b_c
+    
+    def calculate_indirect_probability_all_paths(self, source_id, target_id, intermediate_nodes, relation_types=None):
+        """
+        计算所有中间路径的间接关系概率
+        
+        基于公式:
+        P_{A→C} = 1 - ∏_{i=1}^{m}(1 - P_{A→B_i→C})
+        
+        Parameters:
+        - source_id: 源实体ID
+        - target_id: 目标实体ID
+        - intermediate_nodes: 中间节点ID列表
+        - relation_types: 关系类型列表（可选）
+        
+        Returns:
+        - 通过所有中间节点的间接关系概率
+        """
+        # 检查缓存
+        cache_key = (source_id, target_id, tuple(intermediate_nodes), tuple(relation_types) if relation_types else None)
+        if cache_key in self.indirect_prob_cache:
+            return self.indirect_prob_cache[cache_key]
+        
+        if not intermediate_nodes:
+            return 0.0
+        
+        # 计算通过每个中间节点的概率
+        path_probs = []
+        for node_id in intermediate_nodes:
+            prob = self.calculate_indirect_probability(source_id, target_id, node_id, relation_types)
+            if prob > 0:
+                path_probs.append(prob)
+        
+        if not path_probs:
+            return 0.0
+        
+        # 计算整体概率
+        overall_prob = 1.0 - np.prod([1.0 - p for p in path_probs])
+        
+        # 储存到缓存
+        self.indirect_prob_cache[cache_key] = overall_prob
+        
+        return overall_prob
+    
+    def determine_relation_direction(self, source_id, target_id, intermediate_nodes):
+        """
+        确定间接关系的方向
+        
+        Parameters:
+        - source_id: 源实体ID
+        - target_id: 目标实体ID
+        - intermediate_nodes: 中间节点ID列表
+        
+        Returns:
+        - 关系方向: 1(正相关), -1(负相关), 0(中性), None(未知)
+        """
+        if self.graph is None:
+            logger.error("图对象未设置")
+            return None
+        
+        directions = []
+        
+        for node_id in intermediate_nodes:
+            if self.graph.has_edge(source_id, node_id) and self.graph.has_edge(node_id, target_id):
+                # 获取方向信息
+                dir_a_b = self.graph[source_id][node_id].get('direction', 0)
+                dir_b_c = self.graph[node_id][target_id].get('direction', 0)
+                
+                # 计算复合方向
+                if dir_a_b != 0 and dir_b_c != 0:
+                    # 正负相乘
+                    compound_dir = dir_a_b * dir_b_c
+                    directions.append(compound_dir)
+        
+        if not directions:
+            return None
+        
+        # 取多数方向
+        pos_count = directions.count(1)
+        neg_count = directions.count(-1)
+        
+        if pos_count > neg_count:
+            return 1
+        elif neg_count > pos_count:
+            return -1
+        else:
+            return 0
+    
+    def find_all_paths(self, source_id, target_id, max_length=2):
+        """
+        查找两个节点之间的所有路径
+        
+        Parameters:
+        - source_id: 源节点ID
+        - target_id: 目标节点ID
+        - max_length: 最大路径长度
+        
+        Returns:
+        - 路径列表
+        """
+        if self.graph is None:
+            logger.error("图对象未设置")
+            return []
+        
+        if source_id not in self.graph or target_id not in self.graph:
+            return []
+        
+        try:
+            paths = list(nx.all_simple_paths(self.graph, source_id, target_id, cutoff=max_length))
+            return paths
+        except nx.NetworkXError:
+            return []
+    
+    def infer_indirect_relations(self, source_id, target_id, max_path_length=2):
+        """
+        推断间接关系
+        
+        Parameters:
+        - source_id: 源实体ID
+        - target_id: 目标实体ID
+        - max_path_length: 最大路径长度
+        
+        Returns:
+        - 字典，包含概率、方向、中间路径等信息
+        """
+        if self.graph is None:
+            logger.error("图对象未设置")
+            return {"probability": 0.0, "direction": None, "paths": []}
+        
+        # 查找所有路径
+        paths = self.find_all_paths(source_id, target_id, max_path_length)
+        
+        if not paths:
+            return {"probability": 0.0, "direction": None, "paths": []}
+        
+        # 提取所有中间节点
+        intermediate_nodes = set()
+        for path in paths:
+            if len(path) > 2:  # 至少有一个中间节点
+                intermediate_nodes.update(path[1:-1])
+        
+        # 计算概率
+        probability = self.calculate_indirect_probability_all_paths(
+            source_id, target_id, list(intermediate_nodes))
+        
+        # 确定方向
+        direction = self.determine_relation_direction(
+            source_id, target_id, intermediate_nodes)
+        
+        return {
+            "probability": probability,
+            "direction": direction,
+            "paths": paths,
+            "intermediate_nodes": list(intermediate_nodes)
+        }
+    
+    def batch_infer_relations(self, entity_pairs, max_path_length=2):
+        """
+        批量推断关系
+        
+        Parameters:
+        - entity_pairs: 实体对列表，每对为(source_id, target_id)
+        - max_path_length: 最大路径长度
+        
+        Returns:
+        - 字典，键为实体对，值为推断结果
+        """
+        results = {}
+        
+        for source_id, target_id in tqdm(entity_pairs, desc="推断关系"):
+            result = self.infer_indirect_relations(source_id, target_id, max_path_length)
+            results[(source_id, target_id)] = result
+        
+        return results
+analysis/synergy_analyzer.py
+python
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+药物协同分析模块
+分析两种药物之间的协同作用机制
+"""
+
+import logging
+import pandas as pd
+import numpy as np
+import networkx as nx
+from tqdm import tqdm
+from typing import List, Dict, Tuple, Set, Union, Optional
+
+from analysis.psr_engine import PSREngine
+
+logger = logging.getLogger(__name__)
+
+class SynergyAnalyzer:
+    """药物协同作用分析器"""
+    
+    def __init__(self, graph=None, psr_engine=None):
+        """
+        初始化协同分析器
+        
+        Parameters:
+        - graph: NetworkX图对象（可选）
+        - psr_engine: PSR引擎（可选）
+        """
+        self.graph = graph
+        self.psr_engine = psr_engine if psr_engine else PSREngine(graph)
+        
+        # 结果缓存
+        self.results_cache = {}
+    
+    def set_graph(self, graph):
+        """设置图对象"""
+        self.graph = graph
+        self.psr_engine.set_graph(graph)
+        # 清除缓存
+        self.results_cache = {}
+    
+    def find_common_targets(self, drug1_id, drug2_id, target_type="Gene"):
+        """
+        查找两种药物的共同靶点
+        
+        Parameters:
+        - drug1_id: 第一种药物ID
+        - drug2_id: 第二种药物ID
+        - target_type: 靶点类型（默认为"Gene"）
+        
+        Returns:
+        - 共同靶点列表
+        """
+        if self.graph is None:
+            logger.error("图对象未设置")
+            return []
+        
+        # 检查药物节点是否存在
+        if drug1_id not in self.graph or drug2_id not in self.graph:
+            logger.warning(f"药物 {drug1_id} 或 {drug2_id} 不在图中")
+            return []
+        
+        # 获取药物1的靶点
+        drug1_targets = []
+        for target in self.graph.neighbors(drug1_id):
+            if self.graph.nodes[target].get('type') == target_type:
+                drug1_targets.append(target)
+        
+        # 获取药物2的靶点
+        drug2_targets = []
+        for target in self.graph.neighbors(drug2_id):
+            if self.graph.nodes[target].get('type') == target_type:
+                drug2_targets.append(target)
+        
+        # 计算交集
+        common_targets = set(drug1_targets).intersection(set(drug2_targets))
+        
+        logger.info(f"找到 {len(common_targets)} 个共同靶点")
+        return list(common_targets)
+    
+    def analyze_target_regulation(self, drug_id, target_id):
+        """
+        分析药物对靶点的调节作用
+        
+        Parameters:
+        - drug_id: 药物ID
+        - target_id: 靶点ID
+        
+        Returns:
+        - 调节方向: 1(上调/激活), -1(下调/抑制), 0(中性), None(未知)
+        """
+        if self.graph is None:
+            logger.error("图对象未设置")
+            return None
+        
+        # 检查边是否存在
+        if not self.graph.has_edge(drug_id, target_id):
+            return None
+        
+        # 获取边属性
+        edge_data = self.graph[drug_id][target_id]
+        
+        # 获取方向信息
+        direction = edge_data.get('direction')
+        if direction is not None:
+            return direction
+        
+        # 如果没有明确的方向，尝试从关系类型推断
+        relation_type = edge_data.get('relation_type', '').lower()
+        
+        if 'activates' in relation_type or 'increases' in relation_type or 'positive' in relation_type:
+            return 1
+        elif 'inhibits' in relation_type or 'decreases' in relation_type or 'negative' in relation_type:
+            return -1
+        else:
+            return 0
+    
+    def calculate_synergy_score(self, drug1_id, drug2_id, disease_id, max_path_length=2):
+        """
+        计算药物协同评分
+        
+        Parameters:
+        - drug1_id: 第一种药物ID
+        - drug2_id: 第二种药物ID
+        - disease_id: 疾病ID
+        - max_path_length: 最大路径长度
+        
+        Returns:
+        - 协同评分和详细信息
+        """
+        # 检查缓存
+        cache_key = (drug1_id, drug2_id, disease_id, max_path_length)
+        if cache_key in self.results_cache:
+            return self.results_cache[cache_key]
+        
+        if self.graph is None:
+            logger.error("图对象未设置")
+            return {"score": 0.0, "mechanisms": [], "targets": []}
+        
+        # 找到共同靶点
+        common_targets = self.find_common_targets(drug1_id, drug2_id)
+        
+        # 计算每个靶点的协同评分
+        target_scores = []
+        for target_id in common_targets:
+            # 分析药物对靶点的调节作用
+            drug1_regulation = self.analyze_target_regulation(drug1_id, target_id)
+            drug2_regulation = self.analyze_target_regulation(drug2_id, target_id)
+            
+            # 如果调节作用未知，跳过
+            if drug1_regulation is None or drug2_regulation is None:
+                continue
+            
+            # 分析靶点对疾病的影响
+            target_disease_relation = self.psr_engine.infer_indirect_relations(target_id, disease_id, max_path_length)
+            target_disease_direction = target_disease_relation["direction"]
+            
+            if target_disease_direction is None:
+                continue
+            
+            # 计算调节一致性
+            regulation_consistency = 1 if (drug1_regulation == drug2_regulation) else -1
+            
+            # 计算与疾病相关性
+            disease_relevance = target_disease_relation["probability"]
+            
+            # 组合评分
+            target_score = regulation_consistency * drug1_regulation * drug2_regulation * target_disease_direction * disease_relevance
+            
+            target_scores.append({
+                "target_id": target_id,
+                "target_name": self.graph.nodes[target_id].get("name", ""),
+                "drug1_regulation": drug1_regulation,
+                "drug2_regulation": drug2_regulation,
+                "disease_direction": target_disease_direction,
+                "disease_relevance": disease_relevance,
+                "score": target_score
+            })
+        
+        # 找到药物特有的靶点
+        drug1_targets = set(self.graph.neighbors(drug1_id)) - set(common_targets)
+        drug2_targets = set(self.graph.neighbors(drug2_id)) - set(common_targets)
+        
+        # 分析药物特有靶点的互补性
+        complementary_mechanisms = []
+        
+        # 分析药物1特有靶点
+        for target1_id in drug1_targets:
+            if self.graph.nodes[target1_id].get('type') != "Gene":
+                continue
+                
+            # 分析药物对靶点的调节作用
+            drug1_regulation = self.analyze_target_regulation(drug1_id, target1_id)
+            
+            if drug1_regulation is None:
+                continue
+            
+            # 分析靶点对疾病的影响
+            target1_disease_relation = self.psr_engine.infer_indirect_relations(target1_id, disease_id, max_path_length)
+            target1_disease_direction = target1_disease_relation["direction"]
+            
+            if target1_disease_direction is None:
+                continue
+            
+            # 寻找药物2的互补靶点
+            for target2_id in drug2_targets:
+                if self.graph.nodes[target2_id].get('type') != "Gene":
+                    continue
+                
+                # 分析药物对靶点的调节作用
+                drug2_regulation = self.analyze_target_regulation(drug2_id, target2_id)
+                
+                if drug2_regulation is None:
+                    continue
+                
+                # 分析靶点对疾病的影响
+                target2_disease_relation = self.psr_engine.infer_indirect_relations(target2_id, disease_id, max_path_length)
+                target2_disease_direction = target2_disease_relation["direction"]
+                
+                if target2_disease_direction is None:
+                    continue
+                
+                # 分析两个靶点之间的关系
+                target_interaction = self.psr_engine.infer_indirect_relations(target1_id, target2_id, 1)
+                
+                # 如果两个靶点有直接关系，计算互补性
+                if target_interaction["probability"] > 0:
+                    # 计算互补性评分
+                    complementary_score = (
+                        drug1_regulation * target1_disease_direction * 
+                        drug2_regulation * target2_disease_direction * 
+                        target_interaction["probability"]
+                    )
+                    
+                    complementary_mechanisms.append({
+                        "target1_id": target1_id,
+                        "target1_name": self.graph.nodes[target1_id].get("name", ""),
+                        "target2_id": target2_id,
+                        "target2_name": self.graph.nodes[target2_id].get("name", ""),
+                        "drug1_regulation": drug1_regulation,
+                        "drug2_regulation": drug2_regulation,
+                        "interaction_probability": target_interaction["probability"],
+                        "score": complementary_score
+                    })
+        
+        # 计算总体协同评分
+        total_score = 0.0
+        
+        # 共同靶点贡献
+        if target_scores:
+            common_target_score = sum(item["score"] for item in target_scores) / len(target_scores)
+            total_score += common_target_score * 0.6  # 60%权重
+        
+        # 互补机制贡献
+        if complementary_mechanisms:
+            complementary_score = sum(item["score"] for item in complementary_mechanisms) / len(complementary_mechanisms)
+            total_score += complementary_score * 0.4  # 40%权重
+        
+        # 准备结果
+        result = {
+            "score": total_score,
+            "common_targets": target_scores,
+            "complementary_mechanisms": complementary_mechanisms,
+            "summary": {
+                "common_target_count": len(target_scores),
+                "complementary_mechanism_count": len(complementary_mechanisms)
+            }
+        }
+        
+        # 缓存结果
+        self.results_cache[cache_key] = result
+        
+        return result
+    
+    def rank_synergy_candidates(self, drug_id, disease_id, candidate_drugs, max_path_length=2):
+        """
+        对协同药物候选进行排序
+        
+        Parameters:
+        - drug_id: 基准药物ID
+        - disease_id: 疾病ID
+        - candidate_drugs: 候选药物ID列表
+        - max_path_length: 最大路径长度
+        
+        Returns:
+        - 按协同评分排序的候选药物列表
+        """
+        rankings = []
+        
+        for candidate_id in tqdm(candidate_drugs, desc="评估候选药物"):
+            # 计算协同评分
+            synergy_result = self.calculate_synergy_score(drug_id, candidate_id, disease_id, max_path_length)
+            
+            # 添加到排名列表
+            rankings.append({
+                "drug_id": candidate_id,
+                "drug_name": self.graph.nodes[candidate_id].get("name", "") if self.graph else "",
+                "synergy_score": synergy_result["score"],
+                "common_target_count": synergy_result["summary"]["common_target_count"],
+                "complementary_mechanism_count": synergy_result["summary"]["complementary_mechanism_count"]
+            })
+        
+        # 按评分排序
+        rankings.sort(key=lambda x: x["synergy_score"], reverse=True)
+        
+        return rankings
+analysis/pathway_analyzer.py
+python
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+通路分析模块
+分析生物通路富集和药物作用
+"""
+
+import logging
+import pandas as pd
+import numpy as np
+import networkx as nx
+from scipy import stats
+from tqdm import tqdm
+from typing import List, Dict, Tuple, Set, Union, Optional
+
+logger = logging.getLogger(__name__)
+
+class PathwayAnalyzer:
+    """生物通路分析器"""
+    
+    def __init__(self, graph=None):
+        """
+        初始化通路分析器
+        
+        Parameters:
+        - graph: NetworkX图对象（可选）
+        """
+        self.graph = graph
+        
+        # 缓存
+        self.pathway_gene_cache = {}
+        self.gene_pathway_cache = {}
+    
+    def set_graph(self, graph):
+        """设置图对象"""
+        self.graph = graph
+        # 清除缓存
+        self.pathway_gene_cache = {}
+        self.gene_pathway_cache = {}
+    
+    def get_pathway_genes(self, pathway_id):
+        """
+        获取通路中的基因
+        
+        Parameters:
+        - pathway_id: 通路ID
+        
+        Returns:
+        - 基因ID列表
+        """
+        # 检查缓存
+        if pathway_id in self.pathway_gene_cache:
+            return self.pathway_gene_cache[pathway_id]
+        
+        if self.graph is None:
+            logger.error("图对象未设置")
+            return []
+        
+        # 检查通路节点是否存在
+        if pathway_id not in self.graph:
+            logger.warning(f"通路 {pathway_id} 不在图中")
+            return []
+        
+        # 获取通路相关的基因
+        pathway_genes = []
+        for gene_id in self.graph.neighbors(pathway_id):
+            if self.graph.nodes[gene_id].get('type') == "Gene":
+                pathway_genes.append(gene_id)
+        
+        # 缓存结果
+        self.pathway_gene_cache[pathway_id] = pathway_genes
+        
+        return pathway_genes
+    
+    def get_gene_pathways(self, gene_id):
+        """
+        获取基因参与的通路
+        
+        Parameters:
+        - gene_id: 基因ID
+        
+        Returns:
+        - 通路ID列表
+        """
+        # 检查缓存
+        if gene_id in self.gene_pathway_cache:
+            return self.gene_pathway_cache[gene_id]
+        
+        if self.graph is None:
+            logger.error("图对象未设置")
+            return []
+        
+        # 检查基因节点是否存在
+        if gene_id not in self.graph:
+            logger.warning(f"基因 {gene_id} 不在图中")
+            return []
+        
+        # 获取基因相关的通路
+        gene_pathways = []
+        for pathway_id in self.graph.neighbors(gene_id):
+            if self.graph.nodes[pathway_id].get('type') == "Pathway":
+                gene_pathways.append(pathway_id)
+        
+        # 缓存结果
+        self.gene_pathway_cache[gene_id] = gene_pathways
+        
+        return gene_pathways
+    
+    def get_all_pathways(self):
+        """
+        获取图中的所有通路
+        
+        Returns:
+        - 通路ID列表
+        """
+        if self.graph is None:
+            logger.error("图对象未设置")
+            return []
+        
+        # 查找所有通路类型的节点
+        pathways = [node for node, attrs in self.graph.nodes(data=True) 
+                   if attrs.get('type') == "Pathway"]
+        
+        return pathways
+    
+    def perform_pathway_enrichment(self, gene_list, background_genes=None, p_value_cutoff=0.05):
+        """
+        执行通路富集分析
+        
+        Parameters:
+        - gene_list: 目标基因列表
+        - background_genes: 背景基因列表（可选）
+        - p_value_cutoff: P值阈值
+        
+        Returns:
+        - 富集通路列表，包含统计信息
+        """
+        if self.graph is None:
+            logger.error("图对象未设置")
+            return []
+        
+        # 获取所有通路
+        all_pathways = self.get_all_pathways()
+        
+        # 如果未提供背景基因，使用图中所有基因
+        if background_genes is None:
+            background_genes = [node for node, attrs in self.graph.nodes(data=True) 
+                              if attrs.get('type') == "Gene"]
+        
+        # 将基因列表转换为集合
+        gene_set = set(gene_list)
+        background_set = set(background_genes)
+        
+        # 总背景基因数
+        N = len(background_set)
+        
+        # 目标基因数
+        n = len(gene_set)
+        
+        # 富集结果
+        enrichment_results = []
+        
+        for pathway_id in tqdm(all_pathways, desc="分析通路富集"):
+            # 获取通路基因
+            pathway_genes = set(self.get_pathway_genes(pathway_id))
+            
+            # 通路基因数
+            K = len(pathway_genes)
+            
+            if K == 0:
+                continue
+            
+            # 与背景基因集的交集
+            pathway_background = pathway_genes.intersection(background_set)
+            
+            # 调整通路基因数
+            K = len(pathway_background)
+            
+            # 与目标基因集的交集
+            pathway_hits = pathway_genes.intersection(gene_set)
+            
+            # 命中基因数
+            k = len(pathway_hits)
+            
+            if k == 0:
+                continue
+            
+            # 计算超几何分布的P值
+            # P(X >= k)
+            p_value = stats.hypergeom.sf(k-1, N, K, n)
+            
+            # 如果P值小于阈值，添加到结果
+            if p_value <= p_value_cutoff:
+                # 计算富集倍数
+                fold_enrichment = (k/n) / (K/N)
+                
+                enrichment_results.append({
+                    "pathway_id": pathway_id,
+                    "pathway_name": self.graph.nodes[pathway_id].get('name', ''),
+                    "gene_count": k,
+                    "pathway_size": K,
+                    "background_size": N,
+                    "p_value": p_value,
+                    "fold_enrichment": fold_enrichment,
+                    "genes": list(pathway_hits)
+                })
+        
+        # 按P值排序
+        enrichment_results.sort(key=lambda x: x['p_value'])
+        
+        return enrichment_results
+    
+    def analyze_pathway_overlap(self, pathway_id1, pathway_id2):
+        """
+        分析两个通路的基因重叠程度
+        
+        Parameters:
+        - pathway_id1: 第一个通路ID
+        - pathway_id2: 第二个通路ID
+        
+        Returns:
+        - 重叠分析结果
+        """
+        if self.graph is None:
+            logger.error("图对象未设置")
+            return {"overlap_coefficient": 0, "jaccard_index": 0, "genes": []}
+        
+        # 获取两个通路的基因
+        genes1 = set(self.get_pathway_genes(pathway_id1))
+        genes2 = set(self.get_pathway_genes(pathway_id2))
+        
+        if not genes1 or not genes2:
+            return {"overlap_coefficient": 0, "jaccard_index": 0, "genes": []}
+        
+        # 计算交集
+        intersection = genes1.intersection(genes2)
+        
+        # 计算Overlap系数: |A∩B| / min(|A|,|B|)
+        overlap_coefficient = len(intersection) / min(len(genes1), len(genes2))
+        
+        # 计算Jaccard指数: |A∩B| / |A∪B|
+        jaccard_index = len(intersection) / len(genes1.union(genes2))
+        
+        return {
+            "pathway1_id": pathway_id1,
+            "pathway1_name": self.graph.nodes[pathway_id1].get('name', ''),
+            "pathway1_size": len(genes1),
+            "pathway2_id": pathway_id2,
+            "pathway2_name": self.graph.nodes[pathway_id2].get('name', ''),
+            "pathway2_size": len(genes2),
+            "overlap_coefficient": overlap_coefficient,
+            "jaccard_index": jaccard_index,
+            "shared_gene_count": len(intersection),
+            "shared_genes": list(intersection)
+        }
+    
+    def analyze_drug_pathway_impact(self, drug_id, direct_only=False):
+        """
+        分析药物对通路的影响
+        
+        Parameters:
+        - drug_id: 药物ID
+        - direct_only: 是否仅分析直接影响
+        
+        Returns:
+        - 通路影响分析结果
+        """
+        if self.graph is None:
+            logger.error("图对象未设置")
+            return []
+        
+        # 药物靶点
+        drug_targets = []
+        for target_id in self.graph.neighbors(drug_id):
+            if self.graph.nodes[target_id].get('type') == "Gene":
+                drug_targets.append(target_id)
+        
+        # 收集受影响的通路
+        affected_pathways = {}
+        
+        # 分析每个靶点
+        for target_id in drug_targets:
+            # 获取靶点的通路
+            target_pathways = self.get_gene_pathways(target_id)
+            
+            # 获取药物对靶点的调节方向
+            if self.graph.has_edge(drug_id, target_id):
+                direction = self.graph[drug_id][target_id].get('direction', 0)
+                confidence = self.graph[drug_id][target_id].get('confidence', 0.5)
+            else:
+                direction = 0
+                confidence = 0
+            
+            # 更新通路影响
+            for pathway_id in target_pathways:
+                if pathway_id not in affected_pathways:
+                    affected_pathways[pathway_id] = {
+                        "pathway_id": pathway_id,
+                        "pathway_name": self.graph.nodes[pathway_id].get('name', ''),
+                        "affected_genes": [],
+                        "total_impact": 0,
+                        "confidence": 0
+                    }
+                
+                # 添加受影响的基因
+                affected_pathways[pathway_id]["affected_genes"].append({
+                    "gene_id": target_id,
+                    "gene_name": self.graph.nodes[target_id].get('name', ''),
+                    "direction": direction,
+                    "confidence": confidence
+                })
+                
+                # 更新总体影响
+                affected_pathways[pathway_id]["total_impact"] += direction * confidence
+                affected_pathways[pathway_id]["confidence"] = max(affected_pathways[pathway_id]["confidence"], confidence)
+        
+        # 如果不仅限于直接影响，分析间接影响
+        if not direct_only:
+            # 获取药物靶点的下游基因
+            downstream_genes = set()
+            for target_id in drug_targets:
+                for downstream_id in self.graph.neighbors(target_id):
+                    if self.graph.nodes[downstream_id].get('type') == "Gene" and downstream_id not in drug_targets:
+                        downstream_genes.add(downstream_id)
+            
+            # 分析下游基因的通路
+            for gene_id in downstream_genes:
+                # 获取基因的通路
+                gene_pathways = self.get_gene_pathways(gene_id)
+                
+                # 更新通路影响
+                for pathway_id in gene_pathways:
+                    if pathway_id not in affected_pathways:
+                        affected_pathways[pathway_id] = {
+                            "pathway_id": pathway_id,
+                            "pathway_name": self.graph.nodes[pathway_id].get('name', ''),
+                            "affected_genes": [],
+                            "total_impact": 0,
+                            "confidence": 0
+                        }
+                    
+                    # 对于间接影响，影响较小
+                    affected_pathways[pathway_id]["affected_genes"].append({
+                        "gene_id": gene_id,
+                        "gene_name": self.graph.nodes[gene_id].get('name', ''),
+                        "direction": 0,  # 方向未知
+                        "confidence": 0.3,  # 较低的置信度
+                        "is_indirect": True
+                    })
+        
+        # 转换为列表并排序
+        result = list(affected_pathways.values())
+        result.sort(key=lambda x: abs(x['total_impact']), reverse=True)
+        
+        return result
+analysis/toxicity_reducer.py
+python
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+毒性减轻分析模块
+分析一种药物如何减轻另一种药物的毒性
+"""
+
+import logging
+import pandas as pd
+import numpy as np
+import networkx as nx
+from tqdm import tqdm
+from typing import List, Dict, Tuple, Set, Union, Optional
+
+from analysis.psr_engine import PSREngine
+
+logger = logging.getLogger(__name__)
+
+class ToxicityReducer:
+    """毒性减轻分析器"""
+    
+    def __init__(self, graph=None, psr_engine=None):
+        """
+        初始化毒性减轻分析器
+        
+        Parameters:
+        - graph: NetworkX图对象（可选）
+        - psr_engine: PSR引擎（可选）
+        """
+        self.graph = graph
+        self.psr_engine = psr_engine if psr_engine else PSREngine(graph)
+        
+        # 缓存
+        self.drug_toxicity_cache = {}
+        self.protection_cache = {}
+    
+    def set_graph(self, graph):
+        """设置图对象"""
+        self.graph = graph
+        self.psr_engine.set_graph(graph)
+        # 清除缓存
+        self.drug_toxicity_cache = {}
+        self.protection_cache = {}
+    
+    def identify_toxicity_genes(self, drug_id, toxicity_terms=None):
+        """
+        识别药物毒性相关基因
+        
+        Parameters:
+        - drug_id: 药物ID
+        - toxicity_terms: 毒性相关术语列表（可选）
+        
+        Returns:
+        - 毒性相关基因列表
+        """
+        if self.graph is None:
+            logger.error("图对象未设置")
+            return []
+        
+        # 检查缓存
+        cache_key = (drug_id, tuple(toxicity_terms) if toxicity_terms else None)
+        if cache_key in self.drug_toxicity_cache:
+            return self.drug_toxicity_cache[cache_key]
+        
+        # 默认毒性术语
+        if toxicity_terms is None:
+            toxicity_terms = ["toxicity", "side effect", "adverse", "damage", "injury"]
+        
+        # 收集毒性相关的节点
+        toxicity_nodes = []
+        for node, attrs in self.graph.nodes(data=True):
+            node_name = attrs.get('name', '').lower()
+            if any(term in node_name for term in toxicity_terms):
+                toxicity_nodes.append(node)
+        
+        # 检查药物与毒性节点的关系
+        toxicity_genes = []
+        for toxicity_node in toxicity_nodes:
+            # 尝试找到药物到毒性节点的路径
+            paths = self.psr_engine.find_all_paths(drug_id, toxicity_node, 2)
+            
+            for path in paths:
+                if len(path) == 3:  # 药物-基因-毒性
+                    gene_id = path[1]
+                    if self.graph.nodes[gene_id].get('type') == "Gene":
+                        # 分析药物对基因的调节
+                        if self.graph.has_edge(drug_id, gene_id):
+                            drug_gene_direction = self.graph[drug_id][gene_id].get('direction', 0)
+                        else:
+                            drug_gene_direction = 0
+                        
+                        # 分析基因对毒性的影响
+                        if self.graph.has_edge(gene_id, toxicity_node):
+                            gene_toxicity_direction = self.graph[gene_id][toxicity_node].get('direction', 0)
+                        else:
+                            gene_toxicity_direction = 0
+                        
+                        # 只有当调节方向一致（都是正向或都是负向）时，基因才被认为与毒性相关
+                        if drug_gene_direction * gene_toxicity_direction > 0:
+                            toxicity_genes.append({
+                                "gene_id": gene_id,
+                                "gene_name": self.graph.nodes[gene_id].get('name', ''),
+                                "toxicity_node": toxicity_node,
+                                "toxicity_name": self.graph.nodes[toxicity_node].get('name', ''),
+                                "drug_gene_direction": drug_gene_direction,
+                                "gene_toxicity_direction": gene_toxicity_direction,
+                                "toxicity_contribution": drug_gene_direction * gene_toxicity_direction
+                            })
+        
+        # 缓存结果
+        self.drug_toxicity_cache[cache_key] = toxicity_genes
+        
+        return toxicity_genes
+    
+    def analyze_protective_effects(self, protective_drug_id, toxicity_drug_id, toxicity_terms=None):
+        """
+        分析保护性药物对毒性药物的保护作用
+        
+        Parameters:
+        - protective_drug_id: 保护性药物ID
+        - toxicity_drug_id: 毒性药物ID
+        - toxicity_terms: 毒性相关术语列表（可选）
+        
+        Returns:
+        - 保护作用分析结果
+        """
+        # 检查缓存
+        cache_key = (protective_drug_id, toxicity_drug_id, tuple(toxicity_terms) if toxicity_terms else None)
+        if cache_key in self.protection_cache:
+            return self.protection_cache[cache_key]
+        
+        # 识别毒性药物的毒性相关基因
+        toxicity_genes = self.identify_toxicity_genes(toxicity_drug_id, toxicity_terms)
+        
+        if not toxicity_genes:
+            logger.warning(f"未找到药物 {toxicity_drug_id} 的毒性相关基因")
+            return []
+        
+        # 分析保护性药物对毒性基因的调节作用
+        protective_effects = []
+        
+        for gene_info in toxicity_genes:
+            gene_id = gene_info["gene_id"]
+            
+            # 检查保护性药物是否调节该基因
+            if self.graph.has_edge(protective_drug_id, gene_id):
+                protective_direction = self.graph[protective_drug_id][gene_id].get('direction', 0)
+                protective_confidence = self.graph[protective_drug_id][gene_id].get('confidence', 0.5)
+            else:
+                # 尝试找到间接调节关系
+                indirect_relation = self.psr_engine.infer_indirect_relations(protective_drug_id, gene_id, 2)
+                protective_direction = indirect_relation["direction"]
+                protective_confidence = indirect_relation["probability"]
+                
+                if protective_direction is None or protective_confidence == 0:
+                    continue
+            
+            # 计算保护效果
+            # 如果毒性药物上调一个促进毒性的基因，而保护性药物下调该基因，则有保护作用
+            # 如果毒性药物下调一个抑制毒性的基因，而保护性药物上调该基因，则有保护作用
+            toxicity_effect = gene_info["drug_gene_direction"] * gene_info["gene_toxicity_direction"]
+            protective_effect = -1 * protective_direction * gene_info["gene_toxicity_direction"]
+            
+            # 只有当保护效果为正时，才有保护作用
+            if protective_effect > 0:
+                protective_effects.append({
+                    "gene_id": gene_id,
+                    "gene_name": gene_info["gene_name"],
+                    "toxicity_name": gene_info["toxicity_name"],
+                    "toxicity_drug_effect": gene_info["drug_gene_direction"],
+                    "protective_drug_effect": protective_direction,
+                    "gene_toxicity_relation": gene_info["gene_toxicity_direction"],
+                    "protection_score": protective_effect * protective_confidence,
+                    "confidence": protective_confidence,
+                    "is_direct": self.graph.has_edge(protective_drug_id, gene_id)
+                })
+        
+        # 排序
+        protective_effects.sort(key=lambda x: x["protection_score"], reverse=True)
+        
+        # 缓存结果
+        self.protection_cache[cache_key] = protective_effects
+        
+        return protective_effects
+    
+    def calculate_toxicity_reduction_score(self, protective_drug_id, toxicity_drug_id, toxicity_terms=None):
+        """
+        计算毒性减轻评分
+        
+        Parameters:
+        - protective_drug_id: 保护性药物ID
+        - toxicity_drug_id: 毒性药物ID
+        - toxicity_terms: 毒性相关术语列表（可选）
+        
+        Returns:
+        - 毒性减轻评分和详细信息
+        """
+        # 分析保护作用
+        protective_effects = self.analyze_protective_effects(protective_drug_id, toxicity_drug_id, toxicity_terms)
+        
+        if not protective_effects:
+            return {"score": 0.0, "mechanisms": [], "summary": {}}
+        
+        # 计算总体保护评分
+        total_score = sum(effect["protection_score"] for effect in protective_effects) / len(protective_effects)
+        
+        # 按毒性类型分类
+        toxicity_types = {}
+        for effect in protective_effects:
+            toxicity_name = effect["toxicity_name"]
+            if toxicity_name not in toxicity_types:
+                toxicity_types[toxicity_name] = []
+            toxicity_types[toxicity_name].append(effect)
+        
+        # 准备摘要信息
+        summary = {
+            "total_protective_genes": len(protective_effects),
+            "toxicity_types": len(toxicity_types),
+            "direct_mechanisms": sum(1 for effect in protective_effects if effect["is_direct"]),
+            "indirect_mechanisms": sum(1 for effect in protective_effects if not effect["is_direct"])
+        }
+        
+        return {
+            "score": total_score,
+            "mechanisms": protective_effects,
+            "toxicity_types": toxicity_types,
+            "summary": summary
+        }
+    
+    def rank_protective_candidates(self, toxicity_drug_id, candidate_drugs, toxicity_terms=None):
+        """
+        对保护性药物候选进行排序
+        
+        Parameters:
+        - toxicity_drug_id: 毒性药物ID
+        - candidate_drugs: 候选药物ID列表
+        - toxicity_terms: 毒性相关术语列表（可选）
+        
+        Returns:
+        - 按保护评分排序的候选药物列表
+        """
+        rankings = []
+        
+        for candidate_id in tqdm(candidate_drugs, desc="评估保护性候选药物"):
+            # 计算保护评分
+            protection_result = self.calculate_toxicity_reduction_score(candidate_id, toxicity_drug_id, toxicity_terms)
+            
+            # 添加到排名列表
+            rankings.append({
+                "drug_id": candidate_id,
+                "drug_name": self.graph.nodes[candidate_id].get("name", "") if self.graph else "",
+                "protection_score": protection_result["score"],
+                "protective_gene_count": protection_result["summary"]["total_protective_genes"],
+                "toxicity_type_count": protection_result["summary"]["toxicity_types"]
+            })
+        
+        # 按评分排序
+        rankings.sort(key=lambda x: x["protection_score"], reverse=True)
+        
+        return rankings
+utils/__init__.py
+python
+# 空文件，使utils成为一个包
+utils/file_utils.py
+python
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+文件处理工具模块
+提供文件操作相关的工具函数
+"""
+
+import os
+import json
+import csv
+import logging
+import pandas as pd
+from typing import List, Dict, Any, Union, Optional
+
+logger = logging.getLogger(__name__)
+
+def ensure_directory(directory_path):
+    """
+    确保目录存在，如果不存在则创建
+    
+    Parameters:
+    - directory_path: 目录路径
+    
+    Returns:
+    - 目录路径
+    """
+    if not os.path.exists(directory_path):
+        os.makedirs(directory_path)
+        logger.info(f"创建目录: {directory_path}")
+    
+    return directory_path
+
+def check_directories(data_dir, output_dir):
+    """检查并创建必要的目录"""
+    # 检查数据目录
+    if not os.path.exists(data_dir):
+        logger.error(f"数据目录 {data_dir} 不存在！")
+        return False
+    
+    # 确保数据目录存在
+    if not os.listdir(data_dir):
+        logger.error(f"数据目录 {data_dir} 为空！请添加iKraph数据文件。")
+        return False
+    
+    # 检查必要的数据文件
+    required_files = [
+        "NER_ID_dict_cap_final.json", 
+        "PubMedList.json", 
+        "DBRelations.json", 
+        "RelTypeInt.json"
+    ]
+    
+    for file in required_files:
+        if not os.path.exists(os.path.join(data_dir, file)):
+            logger.error(f"缺少必要的数据文件: {file}")
+            return False
+    
+    # 创建输出目录
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+        logger.info(f"创建输出目录: {output_dir}")
+    
+    # 创建子目录
+    tables_dir = os.path.join(output_dir, "tables")
+    graphs_dir = os.path.join(output_dir, "graphs")
+    reports_dir = os.path.join(output_dir, "reports")
+    
+    if not os.path.exists(tables_dir):
+        os.makedirs(tables_dir)
+        logger.info(f"创建表格目录: {tables_dir}")
+    
+    if not os.path.exists(graphs_dir):
+        os.makedirs(graphs_dir)
+        logger.info(f"创建图形目录: {graphs_dir}")
+    
+    if not os.path.exists(reports_dir):
+        os.makedirs(reports_dir)
+        logger.info(f"创建报告目录: {reports_dir}")
+    
+    return True
+
+def save_to_csv(data, file_path, append=False):
+    """
+    保存数据到CSV文件
+    
+    Parameters:
+    - data: 要保存的数据，可以是字典列表或DataFrame
+    - file_path: 文件路径
+    - append: 是否追加模式
+    
+    Returns:
+    - 文件路径
+    """
+    # 确保目录存在
+    ensure_directory(os.path.dirname(file_path))
+    
+    # 将数据转换为DataFrame
+    if isinstance(data, list):
+        df = pd.DataFrame(data)
+    elif isinstance(data, pd.DataFrame):
+        df = data
+    else:
+        logger.error(f"不支持的数据类型: {type(data)}")
+        return file_path
+    
+    # 保存为CSV
+    mode = 'a' if append else 'w'
+    header = not append if os.path.exists(file_path) else True
+    
+    df.to_csv(file_path, mode=mode, header=header, index=False, encoding='utf-8')
+    logger.info(f"{'追加' if append else '保存'} {len(df)} 条记录到 {file_path}")
+    
+    return file_path
+
+def save_to_json(data, file_path, pretty=True):
+    """
+    保存数据到JSON文件
+    
+    Parameters:
+    - data: 要保存的数据
+    - file_path: 文件路径
+    - pretty: 是否美化JSON格式
+    
+    Returns:
+    - 文件路径
+    """
+    # 确保目录存在
+    ensure_directory(os.path.dirname(file_path))
+    
+    # 保存为JSON
+    with open(file_path, 'w', encoding='utf-8') as f:
+        if pretty:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        else:
+            json.dump(data, f, ensure_ascii=False)
+    
+    logger.info(f"保存数据到 {file_path}")
+    
+    return file_path
+
+def load_csv(file_path):
+    """
+    从CSV文件加载数据
+    
+    Parameters:
+    - file_path: 文件路径
+    
+    Returns:
+    - DataFrame
+    """
+    if not os.path.exists(file_path):
+        logger.error(f"文件不存在: {file_path}")
+        return None
+    
+    try:
+        df = pd.read_csv(file_path, encoding='utf-8')
+        logger.info(f"从 {file_path} 加载了 {len(df)} 条记录")
+        return df
+    except Exception as e:
+        logger.error(f"加载CSV文件 {file_path} 失败: {e}")
+        return None
+
+def load_json(file_path):
+    """
+    从JSON文件加载数据
+    
+    Parameters:
+    - file_path: 文件路径
+    
+    Returns:
+    - 加载的数据
+    """
+    if not os.path.exists(file_path):
+        logger.error(f"文件不存在: {file_path}")
+        return None
+    
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        logger.info(f"从 {file_path} 加载数据")
+        return data
+    except Exception as e:
+        logger.error(f"加载JSON文件 {file_path} 失败: {e}")
+        return None
+
+def save_entities_to_csv(entities, output_dir, file_name="entities.csv", append=False):
+    """保存实体到CSV文件，支持追加模式"""
+    if not entities:
+        logger.warning("没有实体需要保存")
+        return
+    
+    entities_file = os.path.join(output_dir, "tables", file_name)
+    return save_to_csv(entities, entities_file, append)
+
+def save_relations_to_csv(relations, output_dir, file_name="relations.csv", append=False):
+    """保存关系到CSV文件，支持追加模式"""
+    if not relations:
+        logger.warning("没有关系需要保存")
+        return
+    
+    relations_file = os.path.join(output_dir, "tables", file_name)
+    return save_to_csv(relations, relations_file, append)
+utils/text_utils.py
+python
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+文本处理工具模块
+提供文本处理相关的工具函数
+"""
+
+import re
+import unicodedata
+import logging
+
+logger = logging.getLogger(__name__)
+
+def clean_non_ascii_chars(text, preserve_greek=True):
+    """
+    高级文本清理，使用Unicode规范化处理希腊字母
+    
+    Parameters:
+    - text: 要清理的文本
+    - preserve_greek: 是否保留希腊字母
+    
+    Returns:
+    - 清理后的文本
+    """
+    if not isinstance(text, str):
+        return text
+    
+    # 选项1：使用Unicode规范化（保留希腊字母实际形式）
+    if preserve_greek:
+        # 基于Unicode块确定希腊字母
+        def is_greek(char):
+            return 'GREEK' in unicodedata.name(char, '')
+        
+        # 处理文本，保留希腊字母
+        result = ""
+        for char in text:
+            if char.isascii() or is_greek(char):
+                result += char
+            else:
+                # 尝试用NFKD分解获取ASCII等价形式
+                normalized = unicodedata.normalize('NFKD', char)
+                if all(c.isascii() for c in normalized):
+                    result += normalized
+        
+        # 清理多余空格
+        return re.sub(r'\s+', ' ', result).strip()
+    else:
+        # 如果不需要保留希腊字母，使用简单的ASCII过滤
+        cleaned_text = re.sub(r'[^\x00-\x7F]+', '', text)
+        return re.sub(r'\s+', ' ', cleaned_text).strip()
+
+def normalize_text(text):
+    """
+    标准化文本，包括统一大小写、移除特殊字符等
+    
+    Parameters:
+    - text: 要标准化的文本
+    
+    Returns:
+    - 标准化后的文本
+    """
+    if not isinstance(text, str):
+        return text
+    
+    # 转换为小写
+    text = text.lower()
+    
+    # 替换特殊字符
+    text = re.sub(r'[^\w\s]', ' ', text)
+    
+    # 替换多余空格
+    text = re.sub(r'\s+', ' ', text).strip()
+    
+    return text
+
+def split_sentences(text):
+    """
+    将文本拆分为句子
+    
+    Parameters:
+    - text: 要拆分的文本
+    
+    Returns:
+    - 句子列表
+    """
+    if not isinstance(text, str):
+        return []
+    
+    # 简单的句子分割规则
+    sentences = re.split(r'(?<!\w\.\w.)(?<![A-Z][a-z]\.)(?<=\.|\?|\!)\s', text)
+    
+    # 过滤空句子
+    sentences = [s.strip() for s in sentences if s.strip()]
+    
+    return sentences
+
+def is_similar_string(s1, s2, threshold=0.8):
+    """
+    判断两个字符串是否相似
+    
+    Parameters:
+    - s1: 第一个字符串
+    - s2: 第二个字符串
+    - threshold: 相似度阈值
+    
+    Returns:
+    - 是否相似
+    """
+    if not isinstance(s1, str) or not isinstance(s2, str):
+        return False
+    
+    # 标准化
+    s1 = normalize_text(s1)
+    s2 = normalize_text(s2)
+    
+    # 如果字符串完全相同，直接返回True
+    if s1 == s2:
+        return True
+    
+    # 计算Jaccard相似度
+    set1 = set(s1.split())
+    set2 = set(s2.split())
+    
+    intersection = len(set1.intersection(set2))
+    union = len(set1.union(set2))
+    
+    if union == 0:
+        return False
+    
+    similarity = intersection / union
+    
+    return similarity >= threshold
+
+def get_entity_context(text, entity_name, window_size=50):
+    """
+    获取实体在文本中的上下文
+    
+    Parameters:
+    - text: 文本
+    - entity_name: 实体名称
+    - window_size: 上下文窗口大小
+    
+    Returns:
+    - 上下文列表
+    """
+    if not isinstance(text, str) or not isinstance(entity_name, str):
+        return []
+    
+    contexts = []
+    
+    # 查找实体在文本中的所有位置
+    pattern = re.compile(re.escape(entity_name), re.IGNORECASE)
+    for match in pattern.finditer(text):
+        start = max(0, match.start() - window_size)
+        end = min(len(text), match.end() + window_size)
+        context = text[start:end]
+        contexts.append(context)
+    
+    return contexts
+utils/graph_utils.py
+python
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+图操作工具模块
+提供图操作相关的工具函数
+"""
+
+import logging
+import networkx as nx
+import pandas as pd
+import random
+from typing import List, Dict, Tuple, Set, Union, Optional
+
+logger = logging.getLogger(__name__)
+
+def merge_graphs(graphs):
+    """
+    合并多个图
+    
+    Parameters:
+    - graphs: 图对象列表
+    
+    Returns:
+    - 合并后的图
+    """
+    if not graphs:
+        logger.warning("没有图需要合并")
+        return nx.DiGraph()
+    
+    # 创建新图
+    merged_graph = nx.DiGraph()
+    
+    # 合并节点和边
+    for G in graphs:
+        # 添加节点
+        for node, attrs in G.nodes(data=True):
+            if node not in merged_graph:
+                merged_graph.add_node(node, **attrs)
+        
+        # 添加边
+        for source, target, attrs in G.edges(data=True):
+            if not merged_graph.has_edge(source, target):
+                merged_graph.add_edge(source, target, **attrs)
+    
+    logger.info(f"合并了 {len(graphs)} 个图，结果图包含 {len(merged_graph.nodes)} 个节点和 {len(merged_graph.edges)} 条边")
+    return merged_graph
+
+def find_paths(G, source_id, target_id, max_length=2):
+    """
+    查找两个节点之间的所有路径
+    
+    Parameters:
+    - G: NetworkX图
+    - source_id: 源节点ID
+    - target_id: 目标节点ID
+    - max_length: 最大路径长度
+    
+    Returns:
+    - 路径列表
+    """
+    if source_id not in G or target_id not in G:
+        logger.warning(f"源节点 {source_id} 或目标节点 {target_id} 不在图中")
+        return []
+    
+    try:
+        # 使用simple_paths查找所有路径
+        paths = list(nx.all_simple_paths(G, source_id, target_id, cutoff=max_length))
+        logger.info(f"找到 {len(paths)} 条从 {source_id} 到 {target_id} 的路径（最大长度={max_length}）")
+        return paths
+    except nx.NetworkXError as e:
+        logger.error(f"查找路径时出错: {e}")
+        return []
+
+def calculate_centrality(G, method='degree'):
+    """
+    计算图中节点的中心性
+    
+    Parameters:
+    - G: NetworkX图
+    - method: 中心性计算方法，可选值：'degree', 'betweenness', 'closeness', 'eigenvector'
+    
+    Returns:
+    - 节点中心性字典
+    """
+    if len(G.nodes) == 0:
+        logger.warning("图中没有节点")
+        return {}
+    
+    if method == 'degree':
+        centrality = nx.degree_centrality(G)
+    elif method == 'betweenness':
+        centrality = nx.betweenness_centrality(G)
+    elif method == 'closeness':
+        centrality = nx.closeness_centrality(G)
+    elif method == 'eigenvector':
+        centrality = nx.eigenvector_centrality(G, max_iter=1000)
+    else:
+        logger.error(f"不支持的中心性计算方法: {method}")
+        return {}
+    
+    return centrality
+
+def get_subgraph_by_node_types(G, node_types):
+    """
+    根据节点类型获取子图
+    
+    Parameters:
+    - G: NetworkX图
+    - node_types: 节点类型列表
+    
+    Returns:
+    - 子图
+    """
+    if not node_types:
+        logger.warning("未指定节点类型")
+        return G
+    
+    # 筛选节点
+    nodes = [node for node, attrs in G.nodes(data=True) 
+            if attrs.get('type') in node_types]
+    
+    # 创建子图
+    subgraph = G.subgraph(nodes)
+    logger.info(f"创建了包含 {len(subgraph.nodes)} 个节点和 {len(subgraph.edges)} 条边的子图（节点类型: {node_types}）")
+    
+    return subgraph
+
+def get_subgraph_by_relation_types(G, relation_types):
+    """
+    根据关系类型获取子图
+    
+    Parameters:
+    - G: NetworkX图
+    - relation_types: 关系类型列表
+    
+    Returns:
+    - 子图
+    """
+    if not relation_types:
+        logger.warning("未指定关系类型")
+        return G
+    
+    # 创建新图
+    subgraph = nx.DiGraph()
+    
+    # 添加所有节点
+    for node, attrs in G.nodes(data=True):
+        subgraph.add_node(node, **attrs)
+    
+    # 筛选边
+    for source, target, attrs in G.edges(data=True):
+        relation_type = attrs.get('relation_type')
+        if relation_type in relation_types:
+            subgraph.add_edge(source, target, **attrs)
+    
+    # 移除没有边的节点
+    isolated_nodes = list(nx.isolates(subgraph))
+    subgraph.remove_nodes_from(isolated_nodes)
+    
+    logger.info(f"创建了包含 {len(subgraph.nodes)} 个节点和 {len(subgraph.edges)} 条边的子图（关系类型: {relation_types}）")
+    
+    return subgraph
+
+def sample_graph(G, max_nodes=1000, prioritize_nodes=None):
+    """
+    对图进行采样
+    
+    Parameters:
+    - G: NetworkX图
+    - max_nodes: 最大节点数
+    - prioritize_nodes: 优先保留的节点列表
+    
+    Returns:
+    - 采样后的图
+    """
+    if len(G.nodes) <= max_nodes:
+        return G
+    
+    # 确保优先节点存在
+    if prioritize_nodes:
+        priority_nodes = [n for n in prioritize_nodes if n in G]
+    else:
+        priority_nodes = []
+    
+    # 计算剩余节点数
+    remaining = max_nodes - len(priority_nodes)
+    
+    if remaining <= 0:
+        # 如果优先节点超过最大节点数，只保留一部分
+        if len(priority_nodes) > max_nodes:
+            nodes_to_keep = priority_nodes[:max_nodes]
+        else:
+            nodes_to_keep = priority_nodes
+    else:
+        # 随机选择其他节点
+        other_nodes = list(set(G.nodes) - set(priority_nodes))
+        selected_others = random.sample(other_nodes, min(remaining, len(other_nodes)))
+        nodes_to_keep = priority_nodes + selected_others
+    
+    # 创建子图
+    sampled_graph = G.subgraph(nodes_to_keep)
+    logger.info(f"采样图包含 {len(sampled_graph.nodes)} 个节点和 {len(sampled_graph.edges)} 条边")
+    
+    return sampled_graph
+utils/visualization.py
+python
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+可视化工具模块
+提供图形可视化相关的工具函数
+"""
+
+import os
+import logging
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import networkx as nx
+from typing import List, Dict, Tuple, Set, Union, Optional
+
+logger = logging.getLogger(__name__)
+
+# 尝试导入可选的可视化库
+try:
+    from pyvis.network import Network
+    PYVIS_AVAILABLE = True
+except ImportError:
+    logger.warning("未找到pyvis库，某些可视化功能可能不可用")
+    PYVIS_AVAILABLE = False
+
+def generate_network_visualization(G, output_file, title="网络图", height="800px", width="100%"):
+    """
+    生成网络可视化
+    
+    Parameters:
+    - G: NetworkX图
+    - output_file: 输出文件路径
+    - title: 标题
+    - height: 高度
+    - width: 宽度
+    
+    Returns:
+    - 输出文件路径
+    """
+    if not PYVIS_AVAILABLE:
+        logger.error("生成交互式网络图需要pyvis库。请使用 'pip install pyvis' 安装")
+        return None
+    
+    if len(G.nodes) == 0:
+        logger.warning("图中没有节点，无法生成可视化")
+        return None
+    
+    try:
+        # 创建Network对象
+        net = Network(height=height, width=width, directed=True, notebook=False)
+        net.heading = title
+        
+        # 配置节点颜色函数
+        def get_node_color(node_type, is_keyword=False):
+            if node_type == "Chemical" or node_type == "Drug":
+                return "#1f77b4" if is_keyword else "#aec7e8"  # 蓝色/浅蓝色
+            elif node_type == "Disease":
+                return "#d62728" if is_keyword else "#ff9896"  # 红色/浅红色
+            elif node_type == "Gene" or node_type == "Protein":
+                return "#2ca02c"  # 绿色
+            elif node_type == "Pathway":
+                return "#9467bd"  # 紫色
+            else:
+                return "#7f7f7f"  # 灰色
+        
+        # 添加节点
+        for node, attrs in G.nodes(data=True):
+            node_type = attrs.get("type", "Unknown")
+            is_keyword = attrs.get("is_keyword", False)
+            
+            # 节点颜色
+            color = get_node_color(node_type, is_keyword)
+            
+            # 节点大小
+            size = 30 if is_keyword else 20 if node_type in ["Chemical", "Disease", "Drug"] else 15
+            
+            # 节点标题（鼠标悬停显示）
+            title = f"<b>{node_type}: {attrs.get('name', '')}</b><br>"
+            if "External ID" in attrs and attrs["External ID"]:
+                title += f"ID: {attrs['External ID']}<br>"
+            
+            # 添加节点
+            net.add_node(
+                node, 
+                label=attrs.get("name", ""),
+                title=title,
+                color=color,
+                size=size
+            )
+        
+        # 添加边
+        for source, target, attrs in G.edges(data=True):
+            # 边标题
+            edge_title = f"<b>{attrs.get('relation_type', 'Unknown')}</b><br>"
+            if "confidence" in attrs:
+                edge_title += f"Confidence: {attrs.get('confidence', 0):.2f}<br>"
+            if "direction" in attrs:
+                direction = attrs.get("direction")
+                if direction == 1:
+                    edge_title += "Direction: Positive<br>"
+                elif direction == -1:
+                    edge_title += "Direction: Negative<br>"
+            
+            # 边宽度和颜色
+            width = 1 + 2 * attrs.get("confidence", 0.5)
+            
+            # 如果有方向信息，边颜色可以显示方向
+            if "direction" in attrs:
+                direction = attrs.get("direction")
+                if direction == 1:
+                    color = "#1f77b4"  # 蓝色：正向
+                elif direction == -1:
+                    color = "#d62728"  # 红色：负向
+                else:
+                    color = "#7f7f7f"  # 灰色：中性
+            else:
+                color = "#7f7f7f"
+            
+            # 添加边
+            net.add_edge(
+                source, 
+                target,
+                title=edge_title,
+                width=width,
+                color=color
+            )
+        
+        # 配置物理引擎
+        net.set_options("""
+        {
+            "physics": {
+                "forceAtlas2Based": {
+                    "gravitationalConstant": -50,
+                    "centralGravity": 0.01,
+                    "springLength": 100,
+                    "springConstant": 0.08
+                },
+                "solver": "forceAtlas2Based",
+                "stabilization": {
+                    "enabled": true,
+                    "iterations": 1000
+                }
+            },
+            "interaction": {
+                "navigationButtons": true,
+                "keyboard": true,
+                "tooltipDelay": 300
+            }
+        }
+        """)
+        
+        # 保存网络
+        net.save_graph(output_file)
+        logger.info(f"保存网络可视化到 {output_file}")
+        
+        return output_file
+    
+    except Exception as e:
+        logger.error(f"生成网络可视化时出错: {e}")
+        return None
+
+def generate_synergy_heatmap(synergy_scores, output_file, title="药物协同热图"):
+    """
+    生成药物协同热图
+    
+    Parameters:
+    - synergy_scores: 协同评分字典，格式为{(drug1, drug2): score}
+    - output_file: 输出文件路径
+    - title: 标题
+    
+    Returns:
+    - 输出文件路径
+    """
+    if not synergy_scores:
+        logger.warning("没有协同评分数据，无法生成热图")
+        return None
+    
+    try:
+        # 获取所有药物
+        drugs = set()
+        for drug1, drug2 in synergy_scores:
+            drugs.add(drug1)
+            drugs.add(drug2)
+        
+        drugs = sorted(list(drugs))
+        n_drugs = len(drugs)
+        
+        # 创建热图矩阵
+        heatmap_data = np.zeros((n_drugs, n_drugs))
+        
+        # 填充矩阵
+        for i, drug1 in enumerate(drugs):
+            for j, drug2 in enumerate(drugs):
+                if i == j:
+                    heatmap_data[i, j] = 0
+                else:
+                    # 尝试两种顺序，返回存在的那个
+                    key1 = (drug1, drug2)
+                    key2 = (drug2, drug1)
+                    
+                    if key1 in synergy_scores:
+                        heatmap_data[i, j] = synergy_scores[key1]
+                    elif key2 in synergy_scores:
+                        heatmap_data[i, j] = synergy_scores[key2]
+                    else:
+                        heatmap_data[i, j] = 0
+        
+        # 创建热图
+        plt.figure(figsize=(12, 10))
+        plt.imshow(heatmap_data, cmap='viridis')
+        
+        # 添加标签
+        plt.colorbar(label='协同评分')
+        plt.title(title)
+        plt.xticks(range(n_drugs), drugs, rotation=90)
+        plt.yticks(range(n_drugs), drugs)
+        
+        # 保存图片
+        plt.tight_layout()
+        plt.savefig(output_file, dpi=300)
+        plt.close()
+        
+        logger.info(f"保存药物协同热图到 {output_file}")
+        
+        return output_file
+    
+    except Exception as e:
+        logger.error(f"生成药物协同热图时出错: {e}")
+        return None
+
+def generate_pathway_network(pathways, output_file, title="通路网络"):
+    """
+    生成通路网络图
+    
+    Parameters:
+    - pathways: 通路列表，每个通路是一个包含'pathway_id', 'pathway_name', 'genes'等字段的字典
+    - output_file: 输出文件路径
+    - title: 标题
+    
+    Returns:
+    - 输出文件路径
+    """
+    if not pathways:
+        logger.warning("没有通路数据，无法生成网络图")
+        return None
+    
+    try:
+        # 创建通路
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+utils/visualization.py (continued)
+python
+    try:
+        # 创建通路网络图
+        G = nx.Graph()
+        
+        # 添加通路节点
+        for pathway in pathways:
+            G.add_node(
+                pathway['pathway_id'],
+                name=pathway['pathway_name'],
+                type='Pathway',
+                gene_count=len(pathway.get('genes', []))
+            )
+        
+        # 添加通路之间的连接
+        for i, p1 in enumerate(pathways):
+            for j, p2 in enumerate(pathways[i+1:], i+1):
+                # 计算基因重叠
+                genes1 = set(p1.get('genes', []))
+                genes2 = set(p2.get('genes', []))
+                
+                if not genes1 or not genes2:
+                    continue
+                
+                # 计算Jaccard相似度
+                overlap = len(genes1.intersection(genes2))
+                union = len(genes1.union(genes2))
+                
+                if overlap > 0:
+                    similarity = overlap / union
+                    # 添加边
+                    G.add_edge(
+                        p1['pathway_id'],
+                        p2['pathway_id'],
+                        weight=similarity,
+                        overlap=overlap
+                    )
+        
+        # 可视化
+        if PYVIS_AVAILABLE:
+            # 使用pyvis创建交互式网络图
+            net = Network(height="800px", width="100%", notebook=False)
+            
+            # 配置节点大小比例尺
+            min_genes = min(pathway.get('gene_count', 1) for pathway in pathways)
+            max_genes = max(pathway.get('gene_count', 1) for pathway in pathways)
+            
+            # 添加节点
+            for pathway in pathways:
+                # 计算节点大小
+                gene_count = pathway.get('gene_count', 1)
+                size = 10 + (gene_count - min_genes) * 20 / max(1, max_genes - min_genes)
+                
+                net.add_node(
+                    pathway['pathway_id'],
+                    label=pathway['pathway_name'],
+                    title=f"<b>{pathway['pathway_name']}</b><br>Genes: {gene_count}",
+                    color="#9467bd",  # 紫色表示通路
+                    size=int(size)
+                )
+            
+            # 添加边
+            for u, v, attrs in G.edges(data=True):
+                net.add_edge(
+                    u, v,
+                    title=f"Shared genes: {attrs.get('overlap')}<br>Similarity: {attrs.get('weight'):.3f}",
+                    width=1 + 9 * attrs.get('weight', 0),
+                    color={"color": "rgba(200,200,200,0.5)", "opacity": 0.8}
+                )
+            
+            # 设置物理引擎
+            net.set_options("""
+            {
+                "physics": {
+                    "forceAtlas2Based": {
+                        "gravitationalConstant": -100,
+                        "centralGravity": 0.05,
+                        "springLength": 100,
+                        "springConstant": 0.08
+                    },
+                    "solver": "forceAtlas2Based",
+                    "stabilization": {
+                        "enabled": true,
+                        "iterations": 1000
+                    }
+                }
+            }
+            """)
+            
+            # 保存交互式网络图
+            net.save_graph(output_file)
+        else:
+            # 使用matplotlib创建静态网络图
+            plt.figure(figsize=(12, 10))
+            
+            # 计算节点大小
+            node_sizes = []
+            for node in G.nodes():
+                gene_count = G.nodes[node].get('gene_count', 1)
+                size = 100 + gene_count * 10
+                node_sizes.append(size)
+            
+            # 计算边宽度
+            edge_widths = []
+            for u, v in G.edges():
+                weight = G[u][v].get('weight', 0)
+                width = 1 + 5 * weight
+                edge_widths.append(width)
+            
+            # 使用spring_layout进行布局
+            pos = nx.spring_layout(G, seed=42)
+            
+            # 绘制网络
+            nx.draw_networkx_nodes(G, pos, node_color='purple', node_size=node_sizes, alpha=0.8)
+            nx.draw_networkx_edges(G, pos, width=edge_widths, alpha=0.5, edge_color='gray')
+            nx.draw_networkx_labels(G, pos, labels={node: G.nodes[node]['name'] for node in G.nodes()}, font_size=8)
+            
+            plt.title(title)
+            plt.axis('off')
+            plt.tight_layout()
+            plt.savefig(output_file, dpi=300)
+            plt.close()
+            
+        logger.info(f"保存通路网络图到 {output_file}")
+        
+        return output_file
+    
+    except Exception as e:
+        logger.error(f"生成通路网络图时出错: {e}")
+        return None
+
+def generate_mechanism_diagram(mechanisms, output_file, title="作用机制图"):
+    """
+    生成作用机制示意图
+    
+    Parameters:
+    - mechanisms: 机制列表，每个机制是一个字典
+    - output_file: 输出文件路径
+    - title: 标题
+    
+    Returns:
+    - 输出文件路径
+    """
+    if not mechanisms:
+        logger.warning("没有机制数据，无法生成示意图")
+        return None
+    
+    try:
+        # 创建图形
+        plt.figure(figsize=(14, 10))
+        
+        # 创建有向图
+        G = nx.DiGraph()
+        
+        # 收集所有节点
+        all_nodes = set()
+        
+        for mechanism in mechanisms:
+            # 提取药物、基因和毒性/疾病节点
+            drug_id = mechanism.get('drug_id', 'Unknown')
+            drug_name = mechanism.get('drug_name', 'Unknown Drug')
+            
+            gene_id = mechanism.get('gene_id', 'Unknown')
+            gene_name = mechanism.get('gene_name', 'Unknown Gene')
+            
+            target_id = mechanism.get('target_id', mechanism.get('toxicity_id', 'Unknown'))
+            target_name = mechanism.get('target_name', mechanism.get('toxicity_name', 'Unknown Target'))
+            
+            # 添加节点
+            G.add_node(drug_id, name=drug_name, type='Drug')
+            G.add_node(gene_id, name=gene_name, type='Gene')
+            G.add_node(target_id, name=target_name, type='Target')
+            
+            # 提取关系方向
+            drug_gene_direction = mechanism.get('drug_gene_direction', 0)
+            gene_target_direction = mechanism.get('gene_target_direction', 
+                                              mechanism.get('gene_toxicity_direction', 0))
+            
+            # 添加边
+            G.add_edge(drug_id, gene_id, direction=drug_gene_direction)
+            G.add_edge(gene_id, target_id, direction=gene_target_direction)
+            
+            # 收集节点
+            all_nodes.add((drug_id, drug_name, 'Drug'))
+            all_nodes.add((gene_id, gene_name, 'Gene'))
+            all_nodes.add((target_id, target_name, 'Target'))
+        
+        # 使用分层布局
+        pos = nx.multipartite_layout(G, subset_key='type')
+        
+        # 绘制节点
+        drug_nodes = [node for node, attrs in G.nodes(data=True) if attrs.get('type') == 'Drug']
+        gene_nodes = [node for node, attrs in G.nodes(data=True) if attrs.get('type') == 'Gene']
+        target_nodes = [node for node, attrs in G.nodes(data=True) if attrs.get('type') == 'Target']
+        
+        plt.subplot(1, 1, 1)
+        nx.draw_networkx_nodes(G, pos, nodelist=drug_nodes, node_color='blue', node_size=500, alpha=0.8, label='Drugs')
+        nx.draw_networkx_nodes(G, pos, nodelist=gene_nodes, node_color='green', node_size=500, alpha=0.8, label='Genes')
+        nx.draw_networkx_nodes(G, pos, nodelist=target_nodes, node_color='red', node_size=500, alpha=0.8, label='Targets')
+        
+        # 绘制边，不同颜色表示不同方向
+        positive_edges = [(u, v) for u, v, d in G.edges(data=True) if d.get('direction', 0) > 0]
+        negative_edges = [(u, v) for u, v, d in G.edges(data=True) if d.get('direction', 0) < 0]
+        neutral_edges = [(u, v) for u, v, d in G.edges(data=True) if d.get('direction', 0) == 0]
+        
+        nx.draw_networkx_edges(G, pos, edgelist=positive_edges, edge_color='green', arrows=True, width=2, label='Activation')
+        nx.draw_networkx_edges(G, pos, edgelist=negative_edges, edge_color='red', arrows=True, width=2, label='Inhibition')
+        nx.draw_networkx_edges(G, pos, edgelist=neutral_edges, edge_color='gray', arrows=True, width=1, label='Unknown')
+        
+        # 添加节点标签
+        labels = {node: G.nodes[node]['name'] for node in G.nodes()}
+        nx.draw_networkx_labels(G, pos, labels=labels, font_size=10)
+        
+        plt.title(title)
+        plt.axis('off')
+        plt.legend()
+        plt.tight_layout()
+        
+        # 保存图形
+        plt.savefig(output_file, dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        logger.info(f"保存作用机制图到 {output_file}")
+        
+        return output_file
+    
+    except Exception as e:
+        logger.error(f"生成作用机制图时出错: {e}")
+        return None
+scripts/__init__.py
+python
+# 空文件，使scripts成为一个包
+scripts/extract_data.py
+python
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+数据提取脚本
+从iKraph知识图谱中提取实体和关系数据
+"""
+
+import os
+import sys
+import argparse
+import logging
+import pandas as pd
+import networkx as nx
+import gc
+from tqdm import tqdm
+from datetime import datetime
+
+# 添加项目根目录到路径
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# 导入项目模块
+from config.settings import PATHS, DATA_LOADING
+from core.data_loader import load_json_file, enable_large_dataset_processing
+from core.entity_extractor import extract_keyword_entities, extract_entities_by_ids
+from core.relation_extractor import extract_relations_with_entities, update_relation_entity_ids, add_entity_names_to_relations
+from utils.file_utils import check_directories, save_entities_to_csv, save_relations_to_csv
+
+logger = logging.getLogger(__name__)
+
+def parse_arguments():
+    """解析命令行参数"""
+    parser = argparse.ArgumentParser(description='iKraph Knowledge Graph Data Extraction Tool')
+    
+    # 目录参数
+    parser.add_argument('--data_dir', type=str, default=PATHS['data_dir'], help='iKraph数据目录路径')
+    parser.add_argument('--output_dir', type=str, default=PATHS['output_dir'], help='输出目录路径')
+    
+    # 提取参数
+    parser.add_argument('--keywords', type=str, nargs='+', help='关键词列表')
+    parser.add_argument('--drug_keywords', type=str, nargs='+', help='药物关键词列表')
+    parser.add_argument('--disease_keywords', type=str, nargs='+', help='疾病关键词列表')
+    parser.add_argument('--entity_types', type=str, nargs='+', default=[], help='实体类型列表')
+    parser.add_argument('--relation_types', type=str, nargs='+', default=[], help='关系类型列表')
+    parser.add_argument('--exact_match', action='store_true', help='使用精确匹配（默认为部分匹配）')
+    
+    # 性能参数
+    parser.add_argument('--chunk_size', type=int, default=DATA_LOADING['chunk_size'], help='大文件处理的块大小')
+    parser.add_argument('--buffer_size', type=int, default=DATA_LOADING['buffer_size'], help='文件读取缓冲区大小')
+    parser.add_argument('--parallel_chunks', type=int, default=DATA_LOADING['parallel_chunks'], help='并行处理的块数')
+    parser.add_argument('--process_count', type=int, default=DATA_LOADING['process_count'], help='并行处理的进程数')
+    parser.add_argument('--low_memory', action='store_true', help='启用低内存模式')
+    
+    return parser.parse_args()
+
+def run_extraction(args):
+    """运行数据提取流程"""
+    logger.info("启动数据提取流程...")
+    
+    # 启用大型数据集处理
+    enable_large_dataset_processing()
+    
+    # 检查目录
+    if not check_directories(args.data_dir, args.output_dir):
+        logger.error("目录检查失败，退出")
+        return False
+    
+    try:
+        # 加载实体数据
+        logger.info("加载实体数据...")
+        nodes_file = os.path.join(args.data_dir, "NER_ID_dict_cap_final.json")
+        nodes_data = load_json_file(
+            nodes_file,
+            chunk_size=args.chunk_size,
+            low_memory=args.low_memory,
+            method='auto'
+        )
+        
+        if not nodes_data:
+            logger.error("加载实体数据失败")
+            return False
+        
+        # 提取实体
+        logger.info("提取实体...")
+        if args.drug_keywords or args.disease_keywords:
+            # 提取药物实体
+            if args.drug_keywords:
+                drug_entities, drug_id_map = extract_keyword_entities(
+                    nodes_data,
+                    keywords=args.drug_keywords,
+                    entity_types=["Chemical"],
+                    exact_match=args.exact_match
+                )
+                logger.info(f"提取了 {len(drug_entities)} 个药物实体")
+            else:
+                drug_entities = []
+                drug_id_map = {}
+            
+            # 提取疾病实体
+            if args.disease_keywords:
+                disease_entities, disease_id_map = extract_keyword_entities(
+                    nodes_data,
+                    keywords=args.disease_keywords,
+                    entity_types=["Disease"],
+                    exact_match=args.exact_match
+                )
+                logger.info(f"提取了 {len(disease_entities)} 个疾病实体")
+            else:
+                disease_entities = []
+                disease_id_map = {}
+            
+            # 合并实体和ID映射
+            all_entities = drug_entities + disease_entities
+            entity_id_map = {**drug_id_map, **disease_id_map}
+            
+            # 创建焦点实体ID列表
+            focal_ids = [entity["Original ID"] for entity in all_entities]
+            
+        elif args.keywords:
+            # 使用通用关键词提取实体
+            all_entities, entity_id_map = extract_keyword_entities(
+                nodes_data,
+                keywords=args.keywords,
+                entity_types=args.entity_types if args.entity_types else None,
+                exact_match=args.exact_match
+            )
+            logger.info(f"提取了 {len(all_entities)} 个实体")
+            
+            # 创建焦点实体ID列表
+            focal_ids = [entity["Original ID"] for entity in all_entities]
+        else:
+            logger.error("未指定关键词，无法提取实体")
+            return False
+        
+        # 保存焦点实体
+        save_entities_to_csv(all_entities, args.output_dir, "focal_entities.csv")
+        
+        # 提取关系
+        logger.info("提取关系...")
+        
+        # 加载关系类型模式
+        schema_file = os.path.join(args.data_dir, "RelTypeInt.json")
+        with open(schema_file, 'r', encoding='utf-8') as f:
+            relation_schema = json.load(f)
+        
+        # 提取数据库关系
+        logger.info("提取数据库关系...")
+        db_file = os.path.join(args.data_dir, "DBRelations.json")
+        db_data = load_json_file(
+            db_file,
+            chunk_size=args.chunk_size,
+            low_memory=args.low_memory,
+            method='auto'
+        )
+        
+        db_relations = extract_relations_with_entities(
+            db_data,
+            focal_ids,
+            relation_schema
+        )
+        logger.info(f"提取了 {len(db_relations)} 条数据库关系")
+        
+        # 释放内存
+        del db_data
+        gc.collect()
+        
+        # 提取PubMed关系
+        logger.info("提取PubMed关系...")
+        pubmed_file = os.path.join(args.data_dir, "PubMedList.json")
+        
+        # 由于PubMed文件通常很大，使用流式处理
+        pubmed_relations = []
+        for chunk in tqdm(load_json_file(pubmed_file, chunk_size=args.chunk_size, method='stream'), desc="处理PubMed关系"):
+            chunk_relations = extract_relations_with_entities(
+                chunk,
+                focal_ids,
+                relation_schema
+            )
+            pubmed_relations.extend(chunk_relations)
+        
+        logger.info(f"提取了 {len(pubmed_relations)} 条PubMed关系")
+        
+        # 合并关系
+        all_relations = db_relations + pubmed_relations
+        logger.info(f"共提取了 {len(all_relations)} 条关系")
+        
+        # 更新关系的实体ID
+        updated_relations = update_relation_entity_ids(all_relations, entity_id_map)
+        logger.info(f"更新了 {len(updated_relations)} 条关系的实体ID")
+        
+        # 添加实体名称
+        relations_with_names = add_entity_names_to_relations(
+            updated_relations,
+            pd.DataFrame(all_entities)
+        )
+        
+        # 保存关系
+        save_relations_to_csv(relations_with_names, args.output_dir)
+        
+        # 提取关联实体
+        logger.info("提取相关实体...")
+        
+        # 收集所有相关的实体ID
+        related_ids = set()
+        for relation in relations_with_names:
+            related_ids.add(relation["Original Source ID"])
+            related_ids.add(relation["Original Target ID"])
+        
+        # 移除焦点实体ID
+        related_ids = related_ids - set(focal_ids)
+        logger.info(f"发现 {len(related_ids)} 个相关实体")
+        
+        # 提取相关实体
+        if related_ids:
+            related_entities, related_id_map = extract_entities_by_ids(
+                nodes_data,
+                list(related_ids),
+                args.entity_types if args.entity_types else None
+            )
+            
+            # 保存相关实体
+            save_entities_to_csv(related_entities, args.output_dir, "related_entities.csv")
+            
+            # 合并所有实体
+            all_entities_combined = all_entities + related_entities
+            
+            # 保存所有实体
+            save_entities_to_csv(all_entities_combined, args.output_dir, "all_entities.csv")
+            
+            logger.info(f"保存了 {len(all_entities_combined)} 个实体（包括 {len(all_entities)} 个焦点实体和 {len(related_entities)} 个相关实体）")
+        
+        logger.info("数据提取流程完成")
+        return True
+    
+    except Exception as e:
+        logger.error(f"数据提取过程中发生错误: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return False
+
+def main():
+    """主函数"""
+    # 设置日志
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.StreamHandler(),
+            logging.FileHandler('extraction.log', mode='w', encoding='utf-8')
+        ]
+    )
+    
+    # 解析参数
+    args = parse_arguments()
+    
+    # 记录开始时间
+    start_time = datetime.now()
+    logger.info(f"开始处理时间: {start_time}")
+    
+    # 运行提取流程
+    success = run_extraction(args)
+    
+    # 记录结束时间
+    end_time = datetime.now()
+    processing_time = end_time - start_time
+    logger.info(f"结束处理时间: {end_time}")
+    logger.info(f"总处理时间: {processing_time}")
+    
+    # 返回状态码
+    return 0 if success else 1
+
+if __name__ == "__main__":
+    sys.exit(main())
+scripts/analyze_synergy.py
+python
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+药物协同分析脚本
+分析两种药物之间的协同作用机制
+"""
+
+import os
+import sys
+import argparse
+import logging
+import pandas as pd
+import networkx as nx
+import json
+from datetime import datetime
+
+# 添加项目根目录到路径
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# 导入项目模块
+from config.settings import PATHS
+from core.graph_builder import build_networkx_graph
+from analysis.psr_engine import PSREngine
+from analysis.synergy_analyzer import SynergyAnalyzer
+from analysis.pathway_analyzer import PathwayAnalyzer
+from utils.file_utils import load_csv, save_to_json, save_to_csv
+from utils.visualization import generate_network_visualization, generate_mechanism_diagram
+
+logger = logging.getLogger(__name__)
+
+def parse_arguments():
+    """解析命令行参数"""
+    parser = argparse.ArgumentParser(description='iKraph Drug Synergy Analysis Tool')
+    
+    # 输入输出参数
+    parser.add_argument('--entities_file', type=str, default=os.path.join(PATHS['tables_dir'], 'all_entities.csv'), help='实体CSV文件路径')
+    parser.add_argument('--relations_file', type=str, default=os.path.join(PATHS['tables_dir'], 'relations.csv'), help='关系CSV文件路径')
+    parser.add_argument('--output_dir', type=str, default=PATHS['output_dir'], help='输出目录路径')
+    
+    # 药物和疾病参数
+    parser.add_argument('--drug1', type=str, required=True, help='第一种药物名称')
+    parser.add_argument('--drug2', type=str, required=True, help='第二种药物名称')
+    parser.add_argument('--disease', type=str, required=True, help='疾病名称')
+    parser.add_argument('--exact_match', action='store_true', help='使用精确匹配（默认为部分匹配）')
+    
+    # 分析参数
+    parser.add_argument('--max_path_length', type=int, default=2, help='最大路径长度')
+    parser.add_argument('--min_confidence', type=float, default=0.5, help='最小置信度')
+    
+    # 输出参数
+    parser.add_argument('--report_format', type=str, choices=['json', 'csv', 'both'], default='both', help='报告格式')
+    parser.add_argument('--generate_viz', action='store_true', default=True, help='生成可视化')
+    
+    return parser.parse_args()
+
+def find_entity_by_name(entities_df, name, exact_match=False):
+    """根据名称查找实体"""
+    name = name.lower()
+    
+    if exact_match:
+        # 精确匹配
+        matches = entities_df[
+            (entities_df['Name'].str.lower() == name) |
+            (entities_df['Official_Name'].str.lower() == name) |
+            (entities_df['Common_Name'].str.lower() == name)
+        ]
+    else:
+        # 部分匹配
+        matches = entities_df[
+            entities_df['Name'].str.lower().str.contains(name, na=False) |
+            entities_df['Official_Name'].str.lower().str.contains(name, na=False) |
+            entities_df['Common_Name'].str.lower().str.contains(name, na=False)
+        ]
+    
+    if len(matches) == 0:
+        logger.warning(f"未找到匹配'{name}'的实体")
+        return None
+    
+    # 返回最匹配的实体（假设是第一个）
+    return matches.iloc[0]
+
+def run_analysis(args):
+    """运行协同分析流程"""
+    logger.info("启动药物协同分析流程...")
+    
+    # 加载实体和关系数据
+    entities_df = load_csv(args.entities_file)
+    relations_df = load_csv(args.relations_file)
+    
+    if entities_df is None or relations_df is None:
+        logger.error("加载数据失败")
+        return False
+    
+    # 查找药物和疾病实体
+    drug1_entity = find_entity_by_name(entities_df, args.drug1, args.exact_match)
+    drug2_entity = find_entity_by_name(entities_df, args.drug2, args.exact_match)
+    disease_entity = find_entity_by_name(entities_df, args.disease, args.exact_match)
+    
+    if drug1_entity is None or drug2_entity is None or disease_entity is None:
+        logger.error("未找到指定的药物或疾病实体")
+        return False
+    
+    drug1_id = str(drug1_entity['ID'])
+    drug2_id = str(drug2_entity['ID'])
+    disease_id = str(disease_entity['ID'])
+    
+    logger.info(f"分析 {drug1_entity['Name']} (ID: {drug1_id}) 和 {drug2_entity['Name']} (ID: {drug2_id}) 对 {disease_entity['Name']} (ID: {disease_id}) 的协同作用")
+    
+    # 构建网络图
+    G = build_networkx_graph(entities_df, relations_df)
+    logger.info(f"构建了包含 {len(G.nodes)} 个节点和 {len(G.edges)} 条边的网络图")
+    
+    # 创建分析器
+    psr_engine = PSREngine(G)
+    synergy_analyzer = SynergyAnalyzer(G, psr_engine)
+    pathway_analyzer = PathwayAnalyzer(G)
+    
+    # 执行协同分析
+    logger.info("执行协同分析...")
+    synergy_result = synergy_analyzer.calculate_synergy_score(
+        drug1_id, drug2_id, disease_id, args.max_path_length)
+    
+    # 检查结果
+    if not synergy_result or synergy_result["score"] == 0:
+        logger.warning("未发现有效的协同作用机制")
+    else:
+        logger.info(f"协同评分: {synergy_result['score']:.4f}")
+        logger.info(f"发现 {len(synergy_result['common_targets'])} 个共同靶点")
+        logger.info(f"发现 {len(synergy_result['complementary_mechanisms'])} 个互补机制")
+    
+    # 准备输出目录
+    reports_dir = os.path.join(args.output_dir, "reports")
+    os.makedirs(reports_dir, exist_ok=True)
+    
+    # 准备输出文件名
+    base_filename = f"{args.drug1.replace(' ', '_')}_{args.drug2.replace(' ', '_')}_{args.disease.replace(' ', '_')}"
+    
+    # 保存结果
+    if args.report_format in ['json', 'both']:
+        json_file = os.path.join(reports_dir, f"{base_filename}_synergy.json")
+        save_to_json(synergy_result, json_file)
+    
+    if args.report_format in ['csv', 'both']:
+        # 保存共同靶点
+        if synergy_result['common_targets']:
+            common_targets_file = os.path.join(reports_dir, f"{base_filename}_common_targets.csv")
+            save_to_csv(synergy_result['common_targets'], common_targets_file)
+        
+        # 保存互补机制
+        if synergy_result['complementary_mechanisms']:
+            complementary_mechanisms_file = os.path.join(reports_dir, f"{base_filename}_complementary_mechanisms.csv")
+            save_to_csv(synergy_result['complementary_mechanisms'], complementary_mechanisms_file)
+    
+    # 生成可视化
+    if args.generate_viz:
+        graphs_dir = os.path.join(args.output_dir, "graphs")
+        os.makedirs(graphs_dir, exist_ok=True)
+        
+        # 生成网络可视化
+        viz_file = os.path.join(graphs_dir, f"{base_filename}_network.html")
+        subgraph = synergy_analyzer.create_synergy_subgraph(drug1_id, drug2_id, disease_id)
+        generate_network_visualization(subgraph, viz_file, 
+                                      title=f"药物协同网络: {drug1_entity['Name']} + {drug2_entity['Name']} -> {disease_entity['Name']}")
+        
+        # 生成机制图
+        if synergy_result['common_targets'] or synergy_result['complementary_mechanisms']:
+            mechanism_file = os.path.join(graphs_dir, f"{base_filename}_mechanism.png")
+            
+            # 准备机制数据
+            mechanisms = []
+            
+            # 添加共同靶点
+            for target in synergy_result['common_targets']:
+                mechanisms.append({
+                    'drug_id': drug1_id,
+                    'drug_name': drug1_entity['Name'],
+                    'gene_id': target['target_id'],
+                    'gene_name': target['target_name'],
+                    'target_id': disease_id,
+                    'target_name': disease_entity['Name'],
+                    'drug_gene_direction': target['drug1_regulation'],
+                    'gene_target_direction': target['disease_direction'],
+                    'mechanism_type': 'common_target'
+                })
+                
+                mechanisms.append({
+                    'drug_id': drug2_id,
+                    'drug_name': drug2_entity['Name'],
+                    'gene_id': target['target_id'],
+                    'gene_name': target['target_name'],
+                    'target_id': disease_id,
+                    'target_name': disease_entity['Name'],
+                    'drug_gene_direction': target['drug2_regulation'],
+                    'gene_target_direction': target['disease_direction'],
+                    'mechanism_type': 'common_target'
+                })
+            
+            # 添加互补机制
+            for mechanism in synergy_result['complementary_mechanisms']:
+                mechanisms.append({
+                    'drug_id': drug1_id,
+                    'drug_name': drug1_entity['Name'],
+                    'gene_id': mechanism['target1_id'],
+                    'gene_name': mechanism['target1_name'],
+                    'target_id': disease_id,
+                    'target_name': disease_entity['Name'],
+                    'drug_gene_direction': mechanism['drug1_regulation'],
+                    'gene_target_direction': 0,  # 未直接连接到疾病
+                    'mechanism_type': 'complementary'
+                })
+                
+                mechanisms.append({
+                    'drug_id': drug2_id,
+                    'drug_name': drug2_entity['Name'],
+                    'gene_id': mechanism['target2_id'],
+                    'gene_name': mechanism['target2_name'],
+                    'target_id': disease_id,
+                    'target_name': disease_entity['Name'],
+                    'drug_gene_direction': mechanism['drug2_regulation'],
+                    'gene_target_direction': 0,  # 未直接连接到疾病
+                    'mechanism_type': 'complementary'
+                })
+            
+            generate_mechanism_diagram(mechanisms, mechanism_file, 
+                                     title=f"协同作用机制: {drug1_entity['Name']} + {drug2_entity['Name']} -> {disease_entity['Name']}")
+    
+    logger.info("药物协同分析流程完成")
+    return True
+
+def main():
+    """主函数"""
+    # 设置日志
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.StreamHandler(),
+            logging.FileHandler('synergy_analysis.log', mode='w', encoding='utf-8')
+        ]
+    )
+    
+    # 解析参数
+    args = parse_arguments()
+    
+    # 记录开始时间
+    start_time = datetime.now()
+    logger.info(f"开始处理时间: {start_time}")
+    
+    # 运行分析流程
+    success = run_analysis(args)
+    
+    # 记录结束时间
+    end_time = datetime.now()
+    processing_time = end_time - start_time
+    logger.info(f"结束处理时间: {end_time}")
+    logger.info(f"总处理时间: {processing_time}")
+    
+    # 返回状态码
+    return 0 if success else 1
+
+if __name__ == "__main__":
+    sys.exit(main())
+scripts/analyze_toxicity.py
+python
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+毒性减轻分析脚本
+分析一种药物如何减轻另一种药物的毒性
+"""
+
+import os
+import sys
+import argparse
+import logging
+import pandas as pd
+import networkx as nx
+import json
+from datetime import datetime
+
+# 添加项目根目录到路径
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# 导入项目模块
+from config.settings import PATHS
+from core.graph_builder import build_networkx_graph
+from analysis.psr_engine import PSREngine
+from analysis.toxicity_reducer import ToxicityReducer
+from utils.file_utils import load_csv, save_to_json, save_to_csv
+from utils.visualization import generate_network_visualization, generate_mechanism_diagram
+
+logger = logging.getLogger(__name__)
+
+def parse_arguments():
+    """解析命令行参数"""
+    parser = argparse.ArgumentParser(description='iKraph Drug Toxicity Reduction Analysis Tool')
+    
+    # 输入输出参数
+    parser.add_argument('--entities_file', type=str, default=os.path.join(PATHS['tables_dir'], 'all_entities.csv'), help='实体CSV文件路径')
+    parser.add_argument('--relations_file', type=str, default=os.path.join(PATHS['tables_dir'], 'relations.csv'), help='关系CSV文件路径')
+    parser.add_argument('--output_dir', type=str, default=PATHS['output_dir'], help='输出目录路径')
+    
+    # 药物参数
+    parser.add_argument('--toxic_drug', type=str, required=True, help='具有毒性的药物名称')
+    parser.add_argument('--protective_drug', type=str, required=True, help='可能具有保护作用的药物名称')
+    parser.add_argument('--exact_match', action='store_true', help='使用精确匹配（默认为部分匹配）')
+    
+    # 分析参数
+    parser.add_argument('--toxicity_terms', type=str, nargs='+', default=['toxicity', 'adverse', 'damage', 'injury', 'side effect'], help='毒性相关术语')
+    parser.add_argument('--max_path_length', type=int, default=2, help='最大路径长度')
+    parser.add_argument('--min_confidence', type=float, default=0.5, help='最小置信度')
+    
+    # 输出参数
+    parser.add_argument('--report_format', type=str, choices=['json', 'csv', 'both'], default='both', help='报告格式')
+    parser.add_argument('--generate_viz', action='store_true', default=True, help='生成可视化')
+    
+    return parser.parse_args()
+
+def find_entity_by_name(entities_df, name, exact_match=False):
+    """根据名称查找实体"""
+    name = name.lower()
+    
+    if exact_match:
+        # 精确匹配
+        matches = entities_df[
+            (entities_df['Name'].str.lower() == name) |
+            (entities_df['Official_Name'].str.lower() == name) |
+            (entities_df['Common_Name'].str.lower() == name)
+        ]
+    else:
+        # 部分匹配
+        matches = entities_df[
+            entities_df['Name'].str.lower().str.contains(name, na=False) |
+            entities_df['Official_Name'].str.lower().str.contains(name, na=False) |
+            entities_df['Common_Name'].str.lower().str.contains(name, na=False)
+        ]
+    
+    if len(matches) == 0:
+        logger.warning(f"未找到匹配'{name}'的实体")
+        return None
+    
+    # 返回最匹配的实体（假设是第一个）
+    return matches.iloc[0]
+
+def run_analysis(args):
+    """运行毒性减轻分析流程"""
+    logger.info("启动药物毒性减轻分析流程...")
+    
+    # 加载实体和关系数据
+    entities_df = load_csv(args.entities_file)
+    relations_df = load_csv(args.relations_file)
+    
+    if entities_df is None or relations_df is None:
+        logger.error("加载数据失败")
+        return False
+    
+    # 查找药物实体
+    toxic_drug_entity = find_entity_by_name(entities_df, args.toxic_drug, args.exact_match)
+    protective_drug_entity = find_entity_by_name(entities_df, args.protective_drug, args.exact_match)
+    
+    if toxic_drug_entity is None or protective_drug_entity is None:
+        logger.error("未找到指定的药物实体")
+        return False
+    
+    toxic_drug_id = str(toxic_drug_entity['ID'])
+    protective_drug_id = str(protective_drug_entity['ID'])
+    
+    logger.info(f"分析 {protective_drug_entity['Name']} (ID: {protective_drug_id}) 对 {toxic_drug_entity['Name']} (ID: {toxic_drug_id}) 毒性的减轻作用")
+    
+    # 构建网络图
+    G = build_networkx_graph(entities_df, relations_df)
+    logger.info(f"构建了包含 {len(G.nodes)} 个节点和 {len(G.edges)} 条边的网络图")
+    
+    # 创建分析器
+    psr_engine = PSREngine(G)
+    toxicity_reducer = ToxicityReducer(G, psr_engine)
+    
+    # 执行毒性减轻分析
+    logger.info("执行毒性减轻分析...")
+    toxicity_result = toxicity_reducer.calculate_toxicity_reduction_score(
+        protective_drug_id, toxic_drug_id, args.toxicity_terms)
+    
+    # 检查结果
+    if not toxicity_result or toxicity_result["score"] == 0:
+        logger.warning("未发现有效的毒性减轻机制")
+    else:
+        logger.info(f"毒性减轻评分: {toxicity_result['score']:.4f}")
+        logger.info(f"发现 {len(toxicity_result['mechanisms'])} 个保护机制")
+        logger.info(f"影响 {len(toxicity_result['toxicity_types'])} 种毒性类型")
+    
+    # 准备输出目录
+    reports_dir = os.path.join(args.output_dir, "reports")
+    os.makedirs(reports_dir, exist_ok=True)
+    
+    # 准备输出文件名
+    base_filename = f"{args.protective_drug.replace(' ', '_')}_{args.toxic_drug.replace(' ', '_')}_toxicity_reduction"
+    
+    # 保存结果
+    if args.report_format in ['json', 'both']:
+        json_file = os.path.join(reports_dir, f"{base_filename}.json")
+        save_to_json(toxicity_result, json_file)
+    
+    if args.report_format in ['csv', 'both'] and toxicity_result['mechanisms']:
+        # 保存保护机制
+        mechanisms_file = os.path.join(reports_dir, f"{base_filename}_mechanisms.csv")
+        save_to_csv(toxicity_result['mechanisms'], mechanisms_file)
+        
+        # 保存毒性类型
+        toxicity_types = []
+        for toxicity_name, mechanisms in toxicity_result['toxicity_types'].items():
+            for mechanism in mechanisms:
+                mechanism['toxicity_type'] = toxicity_name
+                toxicity_types.append(mechanism)
+        
+        if toxicity_types:
+            toxicity_types_file = os.path.join(reports_dir, f"{base_filename}_toxicity_types.csv")
+            save_to_csv(toxicity_types, toxicity_types_file)
+    
+    # 生成可视化
+    if args.generate_viz and toxicity_result['mechanisms']:
+        graphs_dir = os.path.join(args.output_dir, "graphs")
+        os.makedirs(graphs_dir, exist_ok=True)
+        
+        # 生成机制图
+        mechanism_file = os.path.join(graphs_dir, f"{base_filename}_mechanism.png")
+        generate_mechanism_diagram(toxicity_result['mechanisms'], mechanism_file,
+                                  title=f"毒性减轻机制: {protective_drug_entity['Name']} 保护 {toxic_drug_entity['Name']} 毒性")
+        
+        # 收集毒性节点和基因节点
+        nodes_to_keep = set([toxic_drug_id, protective_drug_id])
+        for mechanism in toxicity_result['mechanisms']:
+            nodes_to_keep.add(mechanism['gene_id'])
+            if 'toxicity_node' in mechanism:
+                nodes_to_keep.add(mechanism['toxicity_node'])
+        
+        # 创建子图
+        subgraph = G.subgraph(nodes_to_keep)
+        
+        # 生成网络可视化
+        viz_file = os.path.join(graphs_dir, f"{base_filename}_network.html")
+        generate_network_visualization(subgraph, viz_file,
+                                     title=f"毒性减轻网络: {protective_drug_entity['Name']} 保护 {toxic_drug_entity['Name']} 毒性")
+    
+    logger.info("药物毒性减轻分析流程完成")
+    return True
+
+def main():
+    """主函数"""
+    # 设置日志
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.StreamHandler(),
+            logging.FileHandler('toxicity_analysis.log', mode='w', encoding='utf-8')
+        ]
+    )
+    
+    # 解析参数
+    args = parse_arguments()
+    
+    # 记录开始时间
+    start_time = datetime.now()
+    logger.info(f"开始处理时间: {start_time}")
+    
+    # 运行分析流程
+    success = run_analysis(args)
+    
+    # 记录结束时间
+    end_time = datetime.now()
+    processing_time = end_time - start_time
+    logger.info(f"结束处理时间: {end_time}")
+    logger.info(f"总处理时间: {processing_time}")
+    
+    # 返回状态码
+    return 0 if success else 1
+
+if __name__ == "__main__":
+    sys.exit(main())
+main.py
+python
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+iKraph药物协同分析系统主程序
+集成了数据提取、协同分析和毒性减轻分析功能
+"""
+
+import os
+import sys
+import argparse
+import logging
+import json
+from datetime import datetime
+
+# 设置日志
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler('ikraph_synergy.log', mode='w', encoding='utf-8')
+    ]
+)
+
+logger = logging.getLogger(__name__)
+
+def parse_arguments():
+    """解析命令行参数"""
+    parser = argparse.ArgumentParser(description="iKraph药物协同分析系统")
+    
+    # 操作模式
+    parser.add_argument('--mode', type=str, choices=['extract', 'synergy', 'toxicity', 'all'], required=True,
+                      help='运行模式: extract(数据提取), synergy(协同分析), toxicity(毒性减轻分析), all(全部)')
+    
+    # 目录参数
+    parser.add_argument('--data_dir', type=str, default='./data', help='iKraph数据目录路径')
+    parser.add_argument('--output_dir', type=str, default='./output', help='输出目录路径')
+    
+    # 提取参数
+    parser.add_argument('--drug1', type=str, help="第一种药物名称")
+    parser.add_argument('--drug2', type=str, help="第二种药物名称")
+    parser.add_argument('--disease', type=str, help="疾病名称")
+    parser.add_argument('--exact_match', action='store_true', help='使用精确匹配（默认为部分匹配）')
+    
+    # 性能参数
+    parser.add_argument('--chunk_size', type=int, default=1000000, help='大文件处理的块大小')
+    parser.add_argument('--low_memory', action='store_true', help='启用低内存模式')
+    
+    return parser.parse_args()
+
+def run_extract(args):
+    """运行数据提取模式"""
+    logger.info("运行数据提取模式...")
+    
+    # 构建extract_data.py的参数
+    extract_args = [
+        'python', 'scripts/extract_data.py',
+        '--data_dir', args.data_dir,
+        '--output_dir', args.output_dir,
+        '--chunk_size', str(args.chunk_size)
+    ]
+    
+    # 添加药物和疾病关键词
+    if args.drug1:
+        extract_args.extend(['--drug_keywords', args.drug1])
+    if args.drug2:
+        extract_args.extend(['--drug_keywords', args.drug2])
+    if args.disease:
+        extract_args.extend(['--disease_keywords', args.disease])
+    
+    # 添加其他参数
+    if args.exact_match:
+        extract_args.append('--exact_match')
+    if args.low_memory:
+        extract_args.append('--low_memory')
+    
+    # 执行命令
+    cmd = ' '.join(extract_args)
+    logger.info(f"执行命令: {cmd}")
+    return os.system(cmd) == 0
+
+def run_synergy(args):
+    """运行协同分析模式"""
+    logger.info("运行协同分析模式...")
+    
+    # 检查必要参数
+    if not args.drug1 or not args.drug2 or not args.disease:
+        logger.error("协同分析模式需要指定drug1, drug2和disease参数")
+        return False
+    
+    # 构建analyze_synergy.py的参数
+    synergy_args = [
+        'python', 'scripts/analyze_synergy.py',
+        '--output_dir', args.output_dir,
+        '--drug1', args.drug1,
+        '--drug2', args.drug2,
+        '--disease', args.disease
+    ]
+    
+    # 添加其他参数
+    if args.exact_match:
+        synergy_args.append('--exact_match')
+    
+    # 执行命令
+    cmd = ' '.join(synergy_args)
+    logger.info(f"执行命令: {cmd}")
+    return os.system(cmd) == 0
+
+def run_toxicity(args):
+    """运行毒性减轻分析模式"""
+    logger.info("运行毒性减轻分析模式...")
+    
+    # 检查必要参数
+    if not args.drug1 or not args.drug2:
+        logger.error("毒性减轻分析模式需要指定drug1和drug2参数")
+        return False
+    
+    # 构建analyze_toxicity.py的参数
+    toxicity_args = [
+        'python', 'scripts/analyze_toxicity.py',
+        '--output_dir', args.output_dir,
+        '--toxic_drug', args.drug1,
+        '--protective_drug', args.drug2
+    ]
+    
+    # 添加其他参数
+    if args.exact_match:
+        toxicity_args.append('--exact_match')
+    
+    # 执行命令
+    cmd = ' '.join(toxicity_args)
+    logger.info(f"执行命令: {cmd}")
+    return os.system(cmd) == 0
+
+def main():
+    """主函数"""
+    # 解析参数
+    args = parse_arguments()
+    
+    # 记录开始时间
+    start_time = datetime.now()
+    logger.info(f"开始处理时间: {start_time}")
+    
+    # 确保输出目录存在
+    os.makedirs(args.output_dir, exist_ok=True)
+    
+    # 根据模式运行相应功能
+    if args.mode == 'extract' or args.mode == 'all':
+        success = run_extract(args)
+        if not success:
+            logger.error("数据提取失败")
+            return 1
+    
+    if args.mode == 'synergy' or args.mode == 'all':
+        success = run_synergy(args)
+        if not success:
+            logger.error("协同分析失败")
+            return 1
+    
+    if args.mode == 'toxicity' or args.mode == 'all':
+        success = run_toxicity(args)
+        if not success:
+            logger.error("毒性减轻分析失败")
+            return 1
+    
+    # 记录结束时间
+    end_time = datetime.now()
+    processing_time = end_time - start_time
+    logger.info(f"结束处理时间: {end_time}")
+    logger.info(f"总处理时间: {processing_time}")
+    
+    logger.info("处理完成!")
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())
+README.md
+markdown
+# iKraph 药物协同分析系统
+
+基于iKraph知识图谱的药物协同作用与毒性减轻分析系统。
+
+## 项目简介
+
+本系统利用iKraph大规模生物医学知识图谱，分析药物之间的协同作用和毒性减轻机制，为药物联合用药提供理论依据。系统支持：
+
+1. 从iKraph知识图谱中提取实体和关系数据
+2. 分析两种药物对特定疾病的协同治疗作用
+3. 分析一种药物如何减轻另一种药物的毒性
+4. 生成可视化报告和网络图
+
+## 系统架构
+
+系统由以下主要模块组成：
+
+- **core**: 核心功能模块，包括数据加载、实体提取、关系提取和图构建
+- **analysis**: 分析模块，包括PSR引擎、协同分析、通路分析和毒性减轻分析
+- **utils**: 工具模块，包括文件处理、文本处理、图操作和可视化
+- **scripts**: 脚本模块，包括数据提取、协同分析和毒性减轻分析脚本
+- **config**: 配置模块，包括全局设置和关系类型定义
+
+## 安装依赖
+
+```bash
+pip install -r requirements.txt
+数据准备
+在运行系统前，请将以下iKraph数据文件放置在./data目录下：
+
+NER_ID_dict_cap_final.json: 实体数据
+PubMedList.json: PubMed关系数据
+DBRelations.json: 数据库关系数据
+RelTypeInt.json: 关系类型模式
+使用方法
+1. 数据提取
+从iKraph知识图谱中提取与特定药物和疾病相关的实体和关系数据：
+
+bash
+python main.py --mode extract --drug1 "汉防己甲素" --drug2 "黄芩苷" --disease "矽肺"
+2. 协同分析
+分析两种药物对特定疾病的协同治疗作用：
+
+bash
+python main.py --mode synergy --drug1 "汉防己甲素" --drug2 "黄芩苷" --disease "矽肺"
+3. 毒性减轻分析
+分析一种药物如何减轻另一种药物的毒性：
+
+bash
+python main.py --mode toxicity --drug1 "汉防己甲素" --drug2 "黄芩苷"
+4. 完整流程
+一次性执行完整分析流程：
+
+bash
+python main.py --mode all --drug1 "汉防己甲素" --drug2 "黄芩苷" --disease "矽肺"
+输出结果
+系统输出结果保存在./output目录下，包括：
+
+tables: 包含提取的实体和关系数据的CSV文件
+graphs: 包含网络可视化和机制示意图
+reports: 包含分析结果的JSON和CSV文件
+概率语义推理（PSR）算法
+系统核心使用PSR算法进行间接关系推断，基于以下公式：
+
+直接关系概率：P(A→B) = 1 - ∏(1 - p(A→B))
+间接关系概率：P(A→C) = 1 - ∏(1 - P(A→B) × P(B→C))
+其中，P(A→B)表示实体A与实体B之间存在直接关系的概率，P(A→C)表示通过中间实体B推断的A与C之间的间接关系概率。
+
+主要特性
+高效数据处理: 支持处理大规模知识图谱数据
+多种分析模式: 支持协同作用和毒性减轻分析
+丰富的可视化: 生成网络图和机制示意图
+灵活的配置: 支持自定义分析参数
+引用
+如果您使用了本系统，请引用iKraph知识图谱原始论文：
+
+Zhang, Y., Sui, X., Pan, F., Yu, K., Li, K., Tian, S., ... & Zhang, J. (2025). A comprehensive large-scale biomedical knowledge graph for AI-powered data-driven biomedical research. Nature Machine Intelligence, [DOI].
+
+### requirements.txt
+pandas>=1.3.0
+numpy>=1.20.0
+networkx>=2.6.0
+matplotlib>=3.4.0
+scipy>=1.7.0
+tqdm>=4.60.0
+pyvis>=0.1.9
+python-rapidjson>=1.0.0
+psutil>=5.8.0
+
+
+这套代码为您提供了一个完整的系统，可以处理iKraph知识图谱数据，分析汉防己甲素与黄芩苷在矽肺治疗中的协同作用和减毒机制。系统遵循模块化设计，保留了batch_main_xin_4_7.py中高效的数据处理功能，同时添加了专门的药物协同分析和毒性减轻分析功能。
+
+您可以通过main.py脚本执行完整流程，或者单独使用各个脚本进行特定分析。系统输出包括详细的数据表格、可视化图形和分析报告，为研究药物组合提供科学依据。

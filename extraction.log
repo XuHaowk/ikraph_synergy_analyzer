@@ -1,0 +1,29 @@
+2025-04-07 16:57:15,124 - __main__ - INFO - 开始处理时间: 2025-04-07 16:57:15.124503
+2025-04-07 16:57:15,124 - __main__ - INFO - 启动数据提取流程...
+2025-04-07 16:57:15,128 - core.data_loader - INFO - 系统内存: 总计=31.8GB, 可用=21.7GB
+2025-04-07 16:57:15,190 - core.data_loader - INFO - 系统已配置为处理大型数据集
+2025-04-07 16:57:15,190 - __main__ - INFO - 加载实体数据...
+2025-04-07 16:57:15,191 - core.data_loader - INFO - Loading file: ./data\NER_ID_dict_cap_final.json
+2025-04-07 16:57:15,191 - core.data_loader - INFO - File size: 2946.50 MB
+2025-04-07 16:57:15,191 - core.data_loader - INFO - Using RapidJSON stream reader for file: ./data\NER_ID_dict_cap_final.json
+2025-04-07 16:57:15,191 - core.data_loader - INFO - File size: 2946.50 MB
+2025-04-07 17:24:11,823 - core.data_loader - INFO - Processed 12108850 JSON objects with RapidJSON
+2025-04-07 17:24:11,827 - core.data_loader - INFO - Loaded 12108850 entries via RapidJSON streaming
+2025-04-07 17:24:11,828 - __main__ - INFO - 提取实体...
+2025-04-07 17:24:11,829 - core.entity_extractor - INFO - 提取关键词实体: 关键词=['Baicalin'], 实体类型=['Chemical'], 精确匹配=False
+2025-04-07 17:24:17,273 - core.entity_extractor - INFO - 提取了 101 个符合条件的关键词实体
+2025-04-07 17:24:17,274 - __main__ - INFO - 提取了 101 个药物实体
+2025-04-07 17:24:17,274 - core.entity_extractor - INFO - 提取关键词实体: 关键词=['Silicosis'], 实体类型=['Disease'], 精确匹配=False
+2025-04-07 17:24:21,555 - core.entity_extractor - INFO - 提取了 72 个符合条件的关键词实体
+2025-04-07 17:24:21,555 - __main__ - INFO - 提取了 72 个疾病实体
+2025-04-07 17:24:21,570 - utils.file_utils - INFO - 保存 173 条记录到 ./output\tables\focal_entities.csv
+2025-04-07 17:24:21,570 - __main__ - INFO - 提取关系...
+2025-04-07 17:24:21,570 - __main__ - ERROR - 数据提取过程中发生错误: name 'json' is not defined
+2025-04-07 17:24:21,571 - __main__ - ERROR - Traceback (most recent call last):
+  File "E:\2024研究方向\生信\ikraph_synergy_analyzer\scripts\extract_data.py", line 144, in run_extraction
+    relation_schema = json.load(f)
+                      ^^^^
+NameError: name 'json' is not defined. Did you forget to import 'json'
+
+2025-04-07 17:24:21,571 - __main__ - INFO - 结束处理时间: 2025-04-07 17:24:21.571891
+2025-04-07 17:24:21,571 - __main__ - INFO - 总处理时间: 0:27:06.447388
