@@ -47,6 +47,11 @@ def parse_arguments():
     parser.add_argument('--chunk_size', type=int, default=1000000, help='大文件处理的块大小')
     parser.add_argument('--low_memory', action='store_true', help='启用低内存模式')
     
+
+    parser.add_argument('--buffer_size', type=int, default=50*1024*1024, help='文件读取缓冲区大小')
+    parser.add_argument('--process_count', type=int, default=4, help='并行处理的进程数')
+    parser.add_argument('--parallel_chunks', type=int, default=24, help='并行处理的块数')
+    
     return parser.parse_args()
 
 def run_extract(args):
@@ -184,5 +189,7 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main()) 
+
+
 
 
