@@ -199,7 +199,7 @@ def load_large_json_streaming_rapidjson(file_path: str, batch_size: int = 100000
                 f.read(1)
                 
                 # Initialize processing variables
-                buffer_size = 50 * 1024 * 1024  # 50MB buffer
+                buffer_size = 200 * 1024 * 1024  # 200MB buffer
                 items_batch = []
                 object_count = 0
                 
@@ -480,3 +480,4 @@ def enable_large_dataset_processing():
         logger.warning(f"无法设置CPU亲和性: {e}")
     
     logger.info("系统已配置为处理大型数据集") 
+

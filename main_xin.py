@@ -30,8 +30,10 @@ def parse_arguments():
     parser = argparse.ArgumentParser(description="iKraph药物协同分析系统")
     
     # 操作模式
-    parser.add_argument('--mode', type=str, choices=['extract', 'synergy', 'toxicity', 'all'], required=True,
-                      help='运行模式: extract(数据提取), synergy(协同分析), toxicity(毒性减轻分析), all(全部)')
+    parser.add_argument('--mode', type=str, 
+                      choices=['extract', 'synergy', 'toxicity', 'hepatorenal', 'all'], 
+                      required=True,
+                      help='运行模式: extract(数据提取), synergy(协同分析), toxicity(毒性减轻分析), hepatorenal(肝肾毒性分析), all(全部)')
     
     # 目录参数
     parser.add_argument('--data_dir', type=str, default='./data', help='iKraph数据目录路径')
@@ -61,7 +63,7 @@ def run_extract(args):
         '--chunk_size', str(args.chunk_size)
     ]
     
-    # 修改: 使用单一的--drug_keywords参数后跟多个值
+    # 添加药物和疾病关键词
     if args.drug1 or args.drug2:
         extract_args.append('--drug_keywords')
         if args.drug1:
@@ -82,12 +84,7 @@ def run_extract(args):
     # 执行命令
     cmd = ' '.join(extract_args)
     logger.info(f"执行命令: {cmd}")
-    
-    # 返回执行结果（0表示成功）
-    result = os.system(cmd)
-    if result != 0:
-        logger.error(f"数据提取命令执行失败，返回代码: {result}")
-    return result == 0
+    return os.system(cmd) == 0
 
 def run_synergy(args):
     """运行协同分析模式"""
@@ -142,6 +139,32 @@ def run_toxicity(args):
     logger.info(f"执行命令: {cmd}")
     return os.system(cmd) == 0
 
+def run_hepatorenal_toxicity(args):
+    """运行肝肾毒性减轻分析模式"""
+    logger.info("运行肝肾毒性减轻分析模式...")
+    
+    # 检查必要参数
+    if not args.drug1 or not args.drug2:
+        logger.error("肝肾毒性减轻分析模式需要指定drug1和drug2参数")
+        return False
+    
+    # 构建analyze_hepatorenal_toxicity.py的参数
+    hepatorenal_args = [
+        'python', 'scripts/analyze_hepatorenal_toxicity.py',
+        '--output_dir', args.output_dir,
+        '--toxic_drug', args.drug1,
+        '--protective_drug', args.drug2
+    ]
+    
+    # 添加其他参数
+    if args.exact_match:
+        hepatorenal_args.append('--exact_match')
+    
+    # 执行命令
+    cmd = ' '.join(hepatorenal_args)
+    logger.info(f"执行命令: {cmd}")
+    return os.system(cmd) == 0
+
 def main():
     """主函数"""
     # 解析参数
@@ -173,6 +196,12 @@ def main():
             logger.error("毒性减轻分析失败")
             return 1
     
+    if args.mode == 'hepatorenal' or args.mode == 'all':
+        success = run_hepatorenal_toxicity(args)
+        if not success:
+            logger.error("肝肾毒性减轻分析失败")
+            return 1
+    
     # 记录结束时间
     end_time = datetime.now()
     processing_time = end_time - start_time
@@ -183,6 +212,4 @@ def main():
     return 0
 
 if __name__ == "__main__":
-    sys.exit(main()) 
-
-
+    sys.exit(main())
