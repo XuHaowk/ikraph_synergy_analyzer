@@ -666,58 +666,61 @@ def process_pubmed_chunk_rapidjson(start_pos, end_pos, file_path, focal_ids, foc
         return result_relations, chunk_entity_connections
     
     return result_relations, chunk_entity_connections
-def parallel_process_pubmed_relations(file_path, focal_ids, focal_entities, relation_schema, num_processes=24, chunk_size=100000, buffer_size=50*1024*1024):
-    """Parallel process PubMed relation data with improved chunking and error handling"""
+
+def parallel_process_pubmed_relations(file_path, focal_ids, focal_entities, relation_schema, num_processes=8, chunk_size=100000, buffer_size=50*1024*1024):
+    """Parallel process PubMed relation data with improved chunking and error handling for Chinese characters"""
     import multiprocessing as mp
+    import os
+    import gc
     
-    logger.info(f"Starting parallel processing with RapidJSON: {num_processes} processes, buffer: {buffer_size/1024/1024:.1f}MB")
+    # Create a multiprocessing context that works well for Windows
+    mp_ctx = mp.get_context('spawn')
     
-    # Calculate file size and divide into smaller chunks for better memory management
+    print(f"Starting parallel PubMed processing: {num_processes} processes, buffer: {buffer_size/1024/1024:.1f}MB")
+    
+    # Calculate file size and create smaller chunks for better memory management
     file_size = os.path.getsize(file_path)
     
-    # Use smaller chunks to prevent memory errors - 25MB chunks instead of evenly dividing file
+    # Use smaller chunks to prevent memory errors - 25MB per chunk
     chunk_size_bytes = 25 * 1024 * 1024  # 25MB chunks
     num_chunks = (file_size // chunk_size_bytes) + 1
     
-    # Limit number of chunks to number of processes to avoid overhead
-    if num_chunks < num_processes:
-        chunk_size_bytes = file_size // num_processes
-        num_chunks = num_processes
+    print(f"Processing PubMed file in {num_chunks} chunks")
     
-    # Create chunk positions
+    # Create chunk positions for processing
     chunk_positions = []
     for i in range(num_chunks):
         start_pos = i * chunk_size_bytes
         end_pos = min((i + 1) * chunk_size_bytes, file_size)
         
-        # Use reduced buffer size to prevent memory errors
+        # Use smaller buffer size to prevent memory errors
         actual_buffer_size = min(buffer_size, chunk_size_bytes // 4)
         
         chunk_positions.append((start_pos, end_pos, file_path, focal_ids, focal_entities, relation_schema, actual_buffer_size))
     
-    # Limit chunks to available processes
-    logger.info(f"Processing file in {len(chunk_positions)} chunks")
-    
-    # Use the process pool with error handling
+    # Process in smaller batches to manage memory better
     all_relations = []
     combined_connections = {
         'drug': {drug_id: set() for drug_id in focal_entities.get('drug', [])},
         'disease': {disease_id: set() for disease_id in focal_entities.get('disease', [])}
     }
     
-    # Process chunks in batches to better manage memory
-    batch_size = max(1, num_processes // 2)  # Process half the chunks at a time
+    # Process only a few chunks at a time (batch_size)
+    batch_size = 2  # Process just 2 chunks at a time to reduce memory usage
+    actual_processes = min(4, num_processes)  # Limit processes to 4 for stability
     
+    # Process chunks in batches
     for i in range(0, len(chunk_positions), batch_size):
         batch_chunks = chunk_positions[i:i+batch_size]
         
         try:
-            with mp.Pool(processes=min(num_processes, len(batch_chunks))) as pool:
+            with mp_ctx.Pool(processes=min(actual_processes, len(batch_chunks))) as pool:
                 results = pool.starmap(process_pubmed_chunk_rapidjson, batch_chunks)
                 
                 # Process results from this batch
                 for relations, connections in results:
                     if relations:  # Only process if we got valid relations
+                        print(f"Chunk processed successfully: found {len(relations)} relations")
                         all_relations.extend(relations)
                         
                         # Merge entity connections
@@ -725,17 +728,19 @@ def parallel_process_pubmed_relations(file_path, focal_ids, focal_entities, rela
                             for entity_id, connected_ids in connections[entity_type].items():
                                 combined_connections[entity_type][entity_id].update(connected_ids)
                 
-                # Force cleanup to prevent memory leaks
+                # Close and join pool to prevent resource leaks
                 pool.close()
                 pool.join()
                 
-            # Explicitly garbage collect between batches
+            # Force garbage collection between batches
             gc.collect()
             
         except Exception as e:
-            logger.error(f"Error processing batch {i//batch_size}: {e}")
+            import traceback
+            print(f"Error processing batch {i//batch_size}: {e}")
+            print(traceback.format_exc())
             # Continue with the next batch
     
-    logger.info(f"Extracted {len(all_relations)} relations from PubMed")
+    print(f"Extracted {len(all_relations)} relations from PubMed")
     
     return all_relations, combined_connections

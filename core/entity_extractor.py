@@ -141,7 +141,7 @@ def extract_entities_from_nodes(nodes_data, keywords=None, entity_types=None, ex
 
 def extract_keyword_entities(nodes_data, keywords=None, entity_types=None, exact_match=False):
     """
-    从节点数据中提取符合特定关键词和实体类型的实体
+    从节点数据中提取符合特定关键词和实体类型的实体，增强对中文关键词的处理
     
     Parameters:
     - nodes_data: 节点数据列表
@@ -154,9 +154,19 @@ def extract_keyword_entities(nodes_data, keywords=None, entity_types=None, exact
     """
     logger.info(f"提取关键词实体: 关键词={keywords}, 实体类型={entity_types}, 精确匹配={exact_match}")
     
-    # 如果提供了关键词，转换为小写以进行不区分大小写的匹配
+    # 如果提供了关键词，为中文保留原始大小写
     if keywords:
-        keywords = [k.lower() for k in keywords]
+        # 对于中文关键词，我们不转换为小写，因为它不适用
+        keywords_for_matching = []
+        for k in keywords:
+            # 检查关键词是否包含中文字符（Unicode范围检查）
+            has_chinese = any('\u4e00' <= char <= '\u9fff' for char in k)
+            if has_chinese:
+                keywords_for_matching.append(k)  # 保留中文原始形式
+            else:
+                keywords_for_matching.append(k.lower())  # 非中文转换为小写
+        
+        keywords = keywords_for_matching  # 将处理后的关键词列表赋值回keywords变量
     
     # 确保nodes_data是列表
     if not isinstance(nodes_data, list):
@@ -173,9 +183,9 @@ def extract_keyword_entities(nodes_data, keywords=None, entity_types=None, exact
         if not isinstance(node, dict):
             continue
         
-        # 获取实体名称（不区分大小写）
-        official_name = str(node.get("official name", "")).lower()
-        common_name = str(node.get("common name", "")).lower()
+        # 获取实体名称
+        original_official_name = str(node.get("official name", ""))
+        original_common_name = str(node.get("common name", ""))
         
         # 获取实体类型
         entity_type = node.get("type", "")
@@ -189,16 +199,36 @@ def extract_keyword_entities(nodes_data, keywords=None, entity_types=None, exact
         keyword_match = False
         if keywords:
             for keyword in keywords:
+                # 检查关键词是否含有中文
+                has_chinese = any('\u4e00' <= char <= '\u9fff' for char in keyword)
+                
                 if exact_match:
-                    # 精确匹配（不区分大小写）
-                    if keyword == official_name or keyword == common_name:
-                        keyword_match = True
-                        break
+                    # 对于中文字符，我们进行直接比较
+                    if has_chinese:
+                        if keyword == original_official_name or keyword == original_common_name:
+                            keyword_match = True
+                            break
+                    else:
+                        # 对于非中文，不区分大小写匹配
+                        official_name_lower = original_official_name.lower()
+                        common_name_lower = original_common_name.lower()
+                        if keyword.lower() == official_name_lower or keyword.lower() == common_name_lower:
+                            keyword_match = True
+                            break
                 else:
-                    # 部分匹配（不区分大小写）
-                    if keyword in official_name or keyword in common_name:
-                        keyword_match = True
-                        break
+                    # 部分匹配
+                    if has_chinese:
+                        # 中文部分匹配需要原始形式
+                        if keyword in original_official_name or keyword in original_common_name:
+                            keyword_match = True
+                            break
+                    else:
+                        # 非中文部分匹配使用小写形式
+                        official_name_lower = original_official_name.lower()
+                        common_name_lower = original_common_name.lower()
+                        if keyword.lower() in official_name_lower or keyword.lower() in common_name_lower:
+                            keyword_match = True
+                            break
         else:
             # 如果没有提供关键词，则默认匹配所有实体类型符合的实体
             keyword_match = True
@@ -206,8 +236,8 @@ def extract_keyword_entities(nodes_data, keywords=None, entity_types=None, exact
         # 如果同时满足类型和关键词匹配条件
         if type_match and keyword_match:
             # 清理名称中的非ASCII字符，但保留希腊字母
-            cleaned_official_name = clean_non_ascii_chars(node.get("official name", ""), preserve_greek=True)
-            cleaned_common_name = clean_non_ascii_chars(node.get("common name", ""), preserve_greek=True)
+            cleaned_official_name = clean_non_ascii_chars(original_official_name, preserve_greek=True)
+            cleaned_common_name = clean_non_ascii_chars(original_common_name, preserve_greek=True)
             
             # 创建实体记录
             entity = {

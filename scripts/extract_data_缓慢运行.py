@@ -18,11 +18,6 @@ import multiprocessing as mp
 import traceback as tb  # 重命名为tb避免作用域冲突
 from tqdm import tqdm
 from datetime import datetime
-from concurrent.futures import ProcessPoolExecutor, as_completed
-from functools import partial
-import io
-import ijson  # 添加ijson库用于高效解析大型JSON文件
-import re
 
 # 尝试导入rapidjson，如果不可用则使用标准json
 try:
@@ -42,10 +37,6 @@ from core.relation_extractor import extract_relations_with_entities, update_rela
 from utils.file_utils import check_directories, save_entities_to_csv, save_relations_to_csv
 
 logger = logging.getLogger(__name__)
-
-# 设置全局常量
-CHUNK_SIZE = 10 * 1024 * 1024  # 10MB 块大小
-MAX_WORKERS = max(1, mp.cpu_count() - 1)  # 使用所有CPU核心数减1
 
 def clean_non_ascii_chars(text, preserve_greek=False):
     """
@@ -117,30 +108,16 @@ def extract_keyword_entities(nodes_data, keywords=None, entity_types=None, exact
         logger.error(f"意外的数据类型: {type(nodes_data)}")
         return [], {}
     
-    # 预筛选实体类型 - 这将大大减少需要处理的节点数量
-    filtered_nodes = []
-    if entity_types:
-        for node in nodes_data:
-            if isinstance(node, dict) and node.get("type") in entity_types:
-                filtered_nodes.append(node)
-    else:
-        filtered_nodes = nodes_data
-    
-    print(f"根据实体类型过滤后剩余 {len(filtered_nodes)} 个节点")
-    
     matched_entities = []
     entity_id_map = {}  # 用于映射biokdeid到新的顺序ID
     
-    # 预编译正则表达式提高性能（针对非中文关键词）
-    regex_patterns = {}
-    if keywords and not exact_match:
-        for keyword in keywords:
-            if not any('\u4e00' <= char <= '\u9fff' for char in keyword):
-                regex_patterns[keyword] = re.compile(re.escape(keyword.lower()))
-    
     # 遍历所有节点
-    total_nodes = len(filtered_nodes)
-    for node in tqdm(filtered_nodes, desc="处理关键词实体", total=total_nodes):
+    total_nodes = len(nodes_data)
+    for node in tqdm(nodes_data, desc="处理关键词实体", total=total_nodes):
+        # 确保节点是字典
+        if not isinstance(node, dict):
+            continue
+        
         # 获取实体名称
         original_official_name = str(node.get("official name", ""))
         original_common_name = str(node.get("common name", ""))
@@ -148,8 +125,7 @@ def extract_keyword_entities(nodes_data, keywords=None, entity_types=None, exact
         # 获取实体类型
         entity_type = node.get("type", "")
         
-        # 检查实体类型是否匹配 - 实际上，由于我们已经过滤了节点，这个检查是多余的
-        # 但保留它以防万一逻辑在其他地方改变
+        # 检查实体类型是否匹配
         type_match = not entity_types or entity_type in entity_types
         if not type_match:
             continue
@@ -157,9 +133,6 @@ def extract_keyword_entities(nodes_data, keywords=None, entity_types=None, exact
         # 检查关键词是否匹配
         keyword_match = False
         if keywords:
-            official_name_lower = None  # 懒加载
-            common_name_lower = None   # 懒加载
-            
             for keyword in keywords:
                 # 检查关键词是否含有中文
                 has_chinese = any('\u4e00' <= char <= '\u9fff' for char in keyword)
@@ -172,11 +145,8 @@ def extract_keyword_entities(nodes_data, keywords=None, entity_types=None, exact
                             break
                     else:
                         # 对于非中文，不区分大小写匹配
-                        if official_name_lower is None:
-                            official_name_lower = original_official_name.lower()
-                        if common_name_lower is None:
-                            common_name_lower = original_common_name.lower()
-                            
+                        official_name_lower = original_official_name.lower()
+                        common_name_lower = original_common_name.lower()
                         if keyword.lower() == official_name_lower or keyword.lower() == common_name_lower:
                             keyword_match = True
                             break
@@ -188,17 +158,12 @@ def extract_keyword_entities(nodes_data, keywords=None, entity_types=None, exact
                             keyword_match = True
                             break
                     else:
-                        # 使用预编译的正则表达式进行更快的部分匹配
-                        pattern = regex_patterns.get(keyword)
-                        if pattern:
-                            if official_name_lower is None:
-                                official_name_lower = original_official_name.lower()
-                            if common_name_lower is None:
-                                common_name_lower = original_common_name.lower()
-                                
-                            if pattern.search(official_name_lower) or pattern.search(common_name_lower):
-                                keyword_match = True
-                                break
+                        # 非中文部分匹配使用小写形式
+                        official_name_lower = original_official_name.lower()
+                        common_name_lower = original_common_name.lower()
+                        if keyword.lower() in official_name_lower or keyword.lower() in common_name_lower:
+                            keyword_match = True
+                            break
         else:
             # 如果没有提供关键词，则默认匹配所有实体类型符合的实体
             keyword_match = True
@@ -299,8 +264,86 @@ def check_pubmed_file_format(file_path):
     except Exception as e:
         print(f"检查文件格式时出错: {e}")
 
-def process_relation_object(relation_obj, focal_ids, focal_entities, relation_schema):
-    """处理单个关系对象并提取关系 - 作为worker函数用于并行处理"""
+def process_found_objects(objects_list, focal_ids, focal_entities, relation_schema, extracted_relations, entity_connections):
+    """处理找到的JSON对象并提取关系"""
+    relation_count = 0
+    
+    for obj_text in objects_list:
+        try:
+            # 解析JSON对象
+            relation_obj = json.loads(obj_text)
+            
+            # 检查是否符合预期结构
+            if not isinstance(relation_obj, dict) or 'id' not in relation_obj or 'list' not in relation_obj:
+                continue
+            
+            # 解析关系ID
+            rel_id_parts = relation_obj['id'].split('.')
+            if len(rel_id_parts) < 3:
+                continue
+            
+            source_id = rel_id_parts[0]
+            target_id = rel_id_parts[1]
+            relation_type = rel_id_parts[2]
+            
+            # 检查是否与焦点实体相关
+            if source_id in focal_ids or target_id in focal_ids:
+                # 获取关系类型名称
+                relation_type_name = relation_schema.get(relation_type)
+                
+                # 从list中提取关系数据
+                for rel_data in relation_obj.get('list', []):
+                    if isinstance(rel_data, list) and len(rel_data) >= 3:
+                        score = rel_data[0]
+                        document_id = rel_data[1]
+                        probability = rel_data[2]
+                        
+                        # 创建关系记录
+                        relation = {
+                            "Original Relation ID": relation_obj['id'],
+                            "Type": relation_type_name if relation_type_name else f"Unknown_{relation_type}",
+                            "Original Type ID": relation_type,
+                            "Original Source ID": source_id,
+                            "Original Target ID": target_id,
+                            "Source": "PubMed",
+                            "Score": score,
+                            "Document ID": document_id,
+                            "Probability": probability
+                        }
+                        
+                        # 添加到提取的关系
+                        extracted_relations.append(relation)
+                        relation_count += 1
+                        
+                        # 跟踪实体连接
+                        # 对于药物
+                        for drug_id in focal_entities.get('drug', []):
+                            if source_id == drug_id and target_id != drug_id:
+                                entity_connections['drug'][drug_id].add(target_id)
+                            elif target_id == drug_id and source_id != drug_id:
+                                entity_connections['drug'][drug_id].add(source_id)
+                        
+                        # 对于疾病
+                        for disease_id in focal_entities.get('disease', []):
+                            if source_id == disease_id and target_id != disease_id:
+                                entity_connections['disease'][disease_id].add(target_id)
+                            elif target_id == disease_id and source_id != disease_id:
+                                entity_connections['disease'][disease_id].add(source_id)
+        
+        except json.JSONDecodeError as e:
+            print(f"警告: 无法解析JSON对象: {e}")
+        except Exception as e:
+            print(f"处理对象时出错: {e}")
+    
+    if relation_count > 0:
+        print(f"在当前批次中找到 {relation_count} 个关系")
+
+def process_pubmed_relations(file_path, focal_ids, focal_entities, relation_schema):
+    """
+    使用字符级解析处理PubMed关系数据，适应任意格式的JSON数组
+    """
+    print("使用改进的字符级解析方法处理PubMed关系...")
+    
     extracted_relations = []
     entity_connections = {
         'drug': {drug_id: set() for drug_id in focal_entities.get('drug', [])},
@@ -308,147 +351,7 @@ def process_relation_object(relation_obj, focal_ids, focal_entities, relation_sc
     }
     
     try:
-        # 检查是否符合预期结构
-        if not isinstance(relation_obj, dict) or 'id' not in relation_obj or 'list' not in relation_obj:
-            return [], {}
-        
-        # 解析关系ID
-        rel_id_parts = relation_obj['id'].split('.')
-        if len(rel_id_parts) < 3:
-            return [], {}
-        
-        source_id = rel_id_parts[0]
-        target_id = rel_id_parts[1]
-        relation_type = rel_id_parts[2]
-        
-        # 检查是否与焦点实体相关
-        if source_id in focal_ids or target_id in focal_ids:
-            # 获取关系类型名称
-            relation_type_name = relation_schema.get(relation_type)
-            
-            # 从list中提取关系数据
-            for rel_data in relation_obj.get('list', []):
-                if isinstance(rel_data, list) and len(rel_data) >= 3:
-                    score = rel_data[0]
-                    document_id = rel_data[1]
-                    probability = rel_data[2]
-                    
-                    # 创建关系记录
-                    relation = {
-                        "Original Relation ID": relation_obj['id'],
-                        "Type": relation_type_name if relation_type_name else f"Unknown_{relation_type}",
-                        "Original Type ID": relation_type,
-                        "Original Source ID": source_id,
-                        "Original Target ID": target_id,
-                        "Source": "PubMed",
-                        "Score": score,
-                        "Document ID": document_id,
-                        "Probability": probability
-                    }
-                    
-                    # 添加到提取的关系
-                    extracted_relations.append(relation)
-                    
-                    # 跟踪实体连接
-                    # 对于药物
-                    for drug_id in focal_entities.get('drug', []):
-                        if source_id == drug_id and target_id != drug_id:
-                            entity_connections['drug'][drug_id].add(target_id)
-                        elif target_id == drug_id and source_id != drug_id:
-                            entity_connections['drug'][drug_id].add(source_id)
-                    
-                    # 对于疾病
-                    for disease_id in focal_entities.get('disease', []):
-                        if source_id == disease_id and target_id != disease_id:
-                            entity_connections['disease'][disease_id].add(target_id)
-                        elif target_id == disease_id and source_id != disease_id:
-                            entity_connections['disease'][disease_id].add(source_id)
-    
-    except Exception as e:
-        print(f"处理对象时出错: {e}")
-    
-    return extracted_relations, entity_connections
-
-def merge_entity_connections(all_connections):
-    """合并多个worker返回的实体连接字典"""
-    merged = {'drug': {}, 'disease': {}}
-    
-    # 初始化合并后的字典
-    for connection_dict in all_connections:
-        # 处理药物
-        for drug_id in connection_dict['drug']:
-            if drug_id not in merged['drug']:
-                merged['drug'][drug_id] = set()
-            merged['drug'][drug_id].update(connection_dict['drug'][drug_id])
-        
-        # 处理疾病
-        for disease_id in connection_dict['disease']:
-            if disease_id not in merged['disease']:
-                merged['disease'][disease_id] = set()
-            merged['disease'][disease_id].update(connection_dict['disease'][disease_id])
-    
-    return merged
-
-def process_pubmed_chunk(chunk_data, focal_ids, focal_entities, relation_schema, chunk_index):
-    """处理PubMed数据的一个块"""
-    print(f"开始处理块 {chunk_index}...")
-    extracted_relations = []
-    entity_connections = {
-        'drug': {drug_id: set() for drug_id in focal_entities.get('drug', [])},
-        'disease': {disease_id: set() for disease_id in focal_entities.get('disease', [])}
-    }
-    
-    try:
-        # 处理该块中的JSON对象
-        objects = []
-        in_object = False
-        bracket_depth = 0
-        buffer = ""
-        
-        # 使用ijson流处理JSON对象
-        # 注意：这里我们处理的是JSON数组中的项目，而不是整个文件
-        items = ijson.items(io.StringIO(chunk_data), 'item')
-        
-        relation_count = 0
-        for obj in items:
-            # 处理单个JSON对象
-            relations, connections = process_relation_object(obj, focal_ids, focal_entities, relation_schema)
-            extracted_relations.extend(relations)
-            
-            # 更新连接
-            for drug_id in connections['drug']:
-                entity_connections['drug'][drug_id].update(connections['drug'][drug_id])
-            for disease_id in connections['disease']:
-                entity_connections['disease'][disease_id].update(connections['disease'][disease_id])
-            
-            relation_count += len(relations)
-            
-            # 定期报告进度
-            if relation_count > 0 and relation_count % 100 == 0:
-                print(f"块 {chunk_index}: 已找到 {relation_count} 个关系")
-    
-    except Exception as e:
-        print(f"处理块 {chunk_index} 时出错: {e}")
-        print(tb.format_exc())
-    
-    print(f"块 {chunk_index} 处理完成，找到 {len(extracted_relations)} 个关系")
-    return extracted_relations, entity_connections
-
-def process_pubmed_relations_parallel(file_path, focal_ids, focal_entities, relation_schema):
-    """
-    使用并行处理和ijson流解析PubMed关系数据
-    """
-    print("使用并行流处理解析PubMed关系...")
-    
-    all_relations = []
-    all_connections = []
-    
-    try:
-        # 获取文件大小
-        file_size = os.path.getsize(file_path)
-        print(f"PubMed文件大小: {file_size/1024/1024:.2f} MB")
-        
-        # 检查文件的前100个字符来确定格式
+        # 读取文件的前100个字符来检测格式
         with open(file_path, 'r', encoding='utf-8') as f:
             prefix = f.read(100)
             
@@ -457,113 +360,73 @@ def process_pubmed_relations_parallel(file_path, focal_ids, focal_entities, rela
             print("警告: PubMed文件不是JSON数组格式，期望文件以'['开头")
             return [], {}
         
-        # 读取并处理整个文件
-        # 首先确定如何分割文件
-        chunk_size = min(CHUNK_SIZE, file_size // (MAX_WORKERS * 2) + 1)  # 确保至少有2个块
-        print(f"使用 {MAX_WORKERS} 个工作进程处理，块大小: {chunk_size/1024/1024:.2f} MB")
-        
-        # 创建处理池
-        with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            futures = []
+        # 使用字符级解析
+        with open(file_path, 'r', encoding='utf-8') as f:
+            content = f.read()
             
-            # 打开文件并在内容上进行迭代
-            with open(file_path, 'r', encoding='utf-8') as f:
-                # 跳过文件开头的'['
-                first_char = f.read(1)
-                if first_char != '[':
-                    f.seek(0)  # 如果不是'['，重置到开头
-                
-                # 分块读取并处理文件
-                chunk_index = 0
-                while True:
-                    # 读取一个数据块
-                    chunk_data = f.read(chunk_size)
-                    if not chunk_data:
-                        break  # 文件末尾
-                    
-                    # 确保我们有一个完整的JSON对象 - 寻找最后一个完整的对象
-                    if chunk_data[-1] != '}':
-                        # 读取直到下一个完整对象的结束
-                        depth = 0
-                        in_string = False
-                        escape_next = False
-                        buffer = ""
-                        
-                        for char in chunk_data[::-1]:  # 从最后向前查找
-                            buffer = char + buffer
-                            
-                            if in_string:
-                                if escape_next:
-                                    escape_next = False
-                                elif char == '\\':
-                                    escape_next = True
-                                elif char == '"':
-                                    in_string = False
-                            else:
-                                if char == '"':
-                                    in_string = True
-                                elif char == '{':
-                                    depth -= 1
-                                    if depth == 0:
-                                        break
-                                elif char == '}':
-                                    depth += 1
-                        
-                        # 截断到最后一个完整对象的位置
-                        pos = len(chunk_data) - len(buffer) + 1
-                        chunk_data = chunk_data[:pos]
-                        
-                        # 回退文件指针，以确保下一个块从正确的位置开始
-                        f.seek(-len(buffer) + 1, io.SEEK_CUR)
-                    
-                    # 确保每个块以有效的JSON格式开始（添加'['）和结束（添加']'）
-                    # 但我们不希望处理字符串内的'[',']'
-                    if chunk_index > 0:  # 非第一块
-                        chunk_data = '[' + chunk_data
-                    
-                    # 所有块都加上']'以便ijson能正确解析
-                    chunk_data = chunk_data + ']'
-                    
-                    # 提交处理任务到进程池
-                    future = executor.submit(
-                        process_pubmed_chunk, 
-                        chunk_data, 
-                        focal_ids, 
-                        focal_entities, 
-                        relation_schema, 
-                        chunk_index
-                    )
-                    futures.append(future)
-                    
-                    chunk_index += 1
-                    print(f"提交块 {chunk_index-1} 处理任务")
+        # 跟踪状态变量
+        objects_found = []
+        bracket_depth = 0
+        in_object = False
+        in_string = False
+        escape_next = False
+        start_pos = 0
+        
+        # 逐字符分析，识别完整的JSON对象
+        for i, char in enumerate(content):
+            # 处理字符串中的字符
+            if in_string:
+                if escape_next:
+                    escape_next = False
+                elif char == '\\':
+                    escape_next = True
+                elif char == '"':
+                    in_string = False
+                continue
             
-            # 收集所有结果
-            for future in tqdm(as_completed(futures), total=len(futures), desc="收集处理结果"):
-                try:
-                    relations, connections = future.result()
-                    all_relations.extend(relations)
-                    all_connections.append(connections)
-                except Exception as e:
-                    print(f"获取任务结果时出错: {e}")
+            # 处理非字符串内容
+            if char == '"':
+                in_string = True
+            elif char == '{':
+                if bracket_depth == 0:
+                    start_pos = i
+                    in_object = True
+                bracket_depth += 1
+            elif char == '}':
+                bracket_depth -= 1
+                if bracket_depth == 0 and in_object:
+                    # 找到了一个完整的JSON对象
+                    obj_text = content[start_pos:i+1]
+                    objects_found.append(obj_text)
+                    in_object = False
+                    
+                    # 每找到100个对象，打印一次进度
+                    if len(objects_found) % 100 == 0:
+                        print(f"已识别 {len(objects_found)} 个JSON对象")
+                        
+                    # 为了避免内存问题，当积累了1000个对象时处理它们
+                    if len(objects_found) >= 1000:
+                        process_found_objects(objects_found, focal_ids, focal_entities, relation_schema, extracted_relations, entity_connections)
+                        objects_found = []  # 清空对象列表
+                        gc.collect()  # 强制垃圾回收
         
-        # 合并连接信息
-        merged_connections = merge_entity_connections(all_connections)
+        # 处理剩余的对象
+        if objects_found:
+            process_found_objects(objects_found, focal_ids, focal_entities, relation_schema, extracted_relations, entity_connections)
         
-        print(f"PubMed处理完成，找到 {len(all_relations)} 个关系")
+        print(f"PubMed处理完成，找到 {len(extracted_relations)} 个关系")
     
     except Exception as e:
         print(f"处理PubMed文件时出错: {e}")
         print(tb.format_exc())
-        return [], {}
     
-    return all_relations, merged_connections
+    return extracted_relations, entity_connections
 
-def simple_pubmed_processing_optimized(file_path, focal_ids, focal_entities, relation_schema):
+def simple_pubmed_processing(file_path, focal_ids, focal_entities, relation_schema):
     """
-    优化的简单PubMed关系处理方法，使用ijson进行流处理
+    简单的PubMed关系处理方法，作为最后的备用选项
     """
-    print("尝试使用优化的PubMed处理方法...")
+    print("尝试使用最简单的PubMed处理方法...")
     
     extracted_relations = []
     entity_connections = {
@@ -572,87 +435,117 @@ def simple_pubmed_processing_optimized(file_path, focal_ids, focal_entities, rel
     }
     
     try:
-        # 使用ijson以流方式处理JSON
-        with open(file_path, 'rb') as f:
-            # 使用ijson.items直接获取数组中的对象
-            objects = ijson.items(f, 'item')
+        # 尝试按照小段读取文件
+        with open(file_path, 'r', encoding='utf-8') as f:
+            # 跳过文件开头的'['
+            f.readline()
             
-            # 使用进程池并行处理对象
-            process_func = partial(
-                process_relation_object, 
-                focal_ids=focal_ids, 
-                focal_entities=focal_entities, 
-                relation_schema=relation_schema
-            )
-            
+            # 处理每个对象
+            buffer = ""
+            depth = 0
+            in_object = False
             object_count = 0
             relation_count = 0
             
-            # 以批处理方式处理对象，每次处理BATCH_SIZE个对象
-            BATCH_SIZE = 1000
-            batch = []
-            
-            with tqdm(desc="处理PubMed关系") as pbar:
-                for obj in objects:
-                    batch.append(obj)
-                    object_count += 1
-                    
-                    # 当达到批处理大小时，并行处理该批次
-                    if len(batch) >= BATCH_SIZE:
-                        with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
-                            results = list(executor.map(process_func, batch))
-                        
-                        # 处理结果
-                        for relations, connections in results:
-                            extracted_relations.extend(relations)
-                            relation_count += len(relations)
-                            
-                            # 更新连接
-                            for drug_id in connections.get('drug', {}):
-                                if drug_id in entity_connections['drug']:
-                                    entity_connections['drug'][drug_id].update(connections['drug'][drug_id])
-                            
-                            for disease_id in connections.get('disease', {}):
-                                if disease_id in entity_connections['disease']:
-                                    entity_connections['disease'][disease_id].update(connections['disease'][disease_id])
-                        
-                        # 更新进度条
-                        pbar.update(len(batch))
-                        pbar.set_description(f"已处理: {object_count} 对象, 找到: {relation_count} 关系")
-                        
-                        # 清空批处理列表
-                        batch = []
-                        
-                        # 强制垃圾回收
-                        gc.collect()
+            for line in f:
+                line = line.strip()
+                if not line or line == ']':
+                    continue
                 
-                # 处理最后一批
-                if batch:
-                    with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
-                        results = list(executor.map(process_func, batch))
+                # 如果行以'{'开头，可能是新对象的开始
+                if line.startswith('{'):
+                    buffer = line
+                    depth = line.count('{') - line.count('}')
+                    in_object = True
+                    continue
+                
+                # 如果在处理一个对象，继续累积内容
+                if in_object:
+                    buffer += line
+                    depth += line.count('{') - line.count('}')
                     
-                    # 处理结果
-                    for relations, connections in results:
-                        extracted_relations.extend(relations)
-                        relation_count += len(relations)
+                    # 如果深度回到0，对象可能已经完成
+                    if depth <= 0:
+                        # 移除末尾的逗号
+                        if buffer.endswith(','):
+                            buffer = buffer[:-1]
                         
-                        # 更新连接
-                        for drug_id in connections.get('drug', {}):
-                            if drug_id in entity_connections['drug']:
-                                entity_connections['drug'][drug_id].update(connections['drug'][drug_id])
+                        try:
+                            # 尝试解析对象
+                            obj = json.loads(buffer)
+                            object_count += 1
+                            
+                            # 检查对象结构
+                            if isinstance(obj, dict) and 'id' in obj and 'list' in obj:
+                                # 解析关系ID
+                                parts = obj['id'].split('.')
+                                if len(parts) >= 3:
+                                    source_id = parts[0]
+                                    target_id = parts[1]
+                                    relation_type = parts[2]
+                                    
+                                    # 检查是否与焦点实体相关
+                                    if source_id in focal_ids or target_id in focal_ids:
+                                        # 获取关系类型名称
+                                        relation_type_name = relation_schema.get(relation_type)
+                                        
+                                        # 从list中提取关系数据
+                                        for rel_data in obj.get('list', []):
+                                            if isinstance(rel_data, list) and len(rel_data) >= 3:
+                                                score = rel_data[0]
+                                                document_id = rel_data[1]
+                                                probability = rel_data[2]
+                                                
+                                                # 创建关系记录
+                                                relation = {
+                                                    "Original Relation ID": obj['id'],
+                                                    "Type": relation_type_name if relation_type_name else f"Unknown_{relation_type}",
+                                                    "Original Type ID": relation_type,
+                                                    "Original Source ID": source_id,
+                                                    "Original Target ID": target_id,
+                                                    "Source": "PubMed",
+                                                    "Score": score,
+                                                    "Document ID": document_id,
+                                                    "Probability": probability
+                                                }
+                                                
+                                                # 添加到提取的关系
+                                                extracted_relations.append(relation)
+                                                relation_count += 1
+                                                
+                                                # 更新连接（这部分代码与上面的函数相同）
+                                                # 对于药物
+                                                for drug_id in focal_entities.get('drug', []):
+                                                    if source_id == drug_id and target_id != drug_id:
+                                                        entity_connections['drug'][drug_id].add(target_id)
+                                                    elif target_id == drug_id and source_id != drug_id:
+                                                        entity_connections['drug'][drug_id].add(source_id)
+                                                
+                                                # 对于疾病
+                                                for disease_id in focal_entities.get('disease', []):
+                                                    if source_id == disease_id and target_id != disease_id:
+                                                        entity_connections['disease'][disease_id].add(target_id)
+                                                    elif target_id == disease_id and source_id != disease_id:
+                                                        entity_connections['disease'][disease_id].add(source_id)
+                            
+                            # 定期报告进度
+                            if object_count % 1000 == 0:
+                                print(f"已处理 {object_count} 个对象，找到 {relation_count} 个关系")
+                                gc.collect()
+                                
+                        except json.JSONDecodeError as e:
+                            # 忽略解析错误，继续处理下一个对象
+                            print(f"无法解析对象: {e}")
                         
-                        for disease_id in connections.get('disease', {}):
-                            if disease_id in entity_connections['disease']:
-                                entity_connections['disease'][disease_id].update(connections['disease'][disease_id])
-                    
-                    # 更新进度条
-                    pbar.update(len(batch))
-                    pbar.set_description(f"已处理: {object_count} 对象, 找到: {relation_count} 关系")
-            
-            print(f"优化处理完成，处理了 {object_count} 个对象，找到 {relation_count} 个关系")
+                        # 重置状态
+                        buffer = ""
+                        in_object = False
+                        depth = 0
+        
+        print(f"简单处理完成，找到 {len(extracted_relations)} 个关系")
     
     except Exception as e:
-        print(f"优化处理时出错: {e}")
+        print(f"简单处理时出错: {e}")
         print(tb.format_exc())
     
     return extracted_relations, entity_connections
@@ -679,22 +572,10 @@ def parse_arguments():
     parser.add_argument('--chunk_size', type=int, default=DATA_LOADING['chunk_size'], help='大文件处理的块大小')
     parser.add_argument('--buffer_size', type=int, default=DATA_LOADING['buffer_size'], help='文件读取缓冲区大小')
     parser.add_argument('--parallel_chunks', type=int, default=DATA_LOADING['parallel_chunks'], help='并行处理的块数')
-    parser.add_argument('--process_count', type=int, default=mp.cpu_count()-1, help='并行处理的进程数')
+    parser.add_argument('--process_count', type=int, default=DATA_LOADING['process_count'], help='并行处理的进程数')
     parser.add_argument('--low_memory', action='store_true', help='启用低内存模式')
     
     args = parser.parse_args()
-    
-    # 设置全局常量
-    global MAX_WORKERS
-    global CHUNK_SIZE
-    
-    # 根据用户参数设置最大工作进程数
-    if args.process_count > 0:
-        MAX_WORKERS = args.process_count
-    
-    # 根据用户参数设置块大小
-    if args.chunk_size > 0:
-        CHUNK_SIZE = args.chunk_size
     
     # 添加调试输出
     print("解析后的参数:")
@@ -703,8 +584,6 @@ def parse_arguments():
     print("药物关键词:", args.drug_keywords)
     print("疾病关键词:", args.disease_keywords)
     print("精确匹配:", args.exact_match)
-    print("使用进程数:", MAX_WORKERS)
-    print("块大小:", CHUNK_SIZE)
     print("检查数据目录:")
     print("目录存在:", os.path.exists(args.data_dir))
     if os.path.exists(args.data_dir):
@@ -747,16 +626,12 @@ def run_extraction(args):
             drug_id_map = {}
             
             if args.drug_keywords:
-                # 预过滤节点数据，只保留可能是药物的实体
-                chemical_nodes = [node for node in nodes_data if isinstance(node, dict) and node.get("type") == "Chemical"]
-                print(f"预过滤后的化学实体节点数: {len(chemical_nodes)}")
-                
                 # 处理多个药物关键词，逐个提取
                 for drug_keyword in args.drug_keywords:
                     logger.info(f"提取药物: {drug_keyword}")
                     print(f"正在提取药物: {drug_keyword}")
                     drug_entities_single, drug_id_map_single = extract_keyword_entities(
-                        chemical_nodes,  # 使用预过滤的节点
+                        nodes_data,
                         keywords=[drug_keyword],  # 使用单个关键词
                         entity_types=["Chemical"],
                         exact_match=args.exact_match
@@ -772,15 +647,11 @@ def run_extraction(args):
             disease_id_map = {}
             
             if args.disease_keywords:
-                # 预过滤节点数据，只保留可能是疾病的实体
-                disease_nodes = [node for node in nodes_data if isinstance(node, dict) and node.get("type") == "Disease"]
-                print(f"预过滤后的疾病实体节点数: {len(disease_nodes)}")
-                
                 for disease_keyword in args.disease_keywords:
                     logger.info(f"提取疾病: {disease_keyword}")
                     print(f"正在提取疾病: {disease_keyword}")
                     disease_entities_single, disease_id_map_single = extract_keyword_entities(
-                        disease_nodes,  # 使用预过滤的节点
+                        nodes_data,
                         keywords=[disease_keyword],  # 使用单个关键词
                         entity_types=["Disease"],
                         exact_match=args.exact_match
@@ -799,16 +670,9 @@ def run_extraction(args):
             focal_ids = [entity["Original ID"] for entity in all_entities]
             
         elif args.keywords:
-            # 使用通用关键词提取实体 - 如果有实体类型指定，先过滤一次
-            if args.entity_types:
-                filtered_nodes = [node for node in nodes_data if isinstance(node, dict) and node.get("type") in args.entity_types]
-                print(f"按实体类型预过滤后的节点数: {len(filtered_nodes)}")
-                nodes_to_process = filtered_nodes
-            else:
-                nodes_to_process = nodes_data
-            
+            # 使用通用关键词提取实体
             all_entities, entity_id_map = extract_keyword_entities(
-                nodes_to_process,
+                nodes_data,
                 keywords=args.keywords,
                 entity_types=args.entity_types if args.entity_types else None,
                 exact_match=args.exact_match
@@ -825,10 +689,6 @@ def run_extraction(args):
         save_entities_to_csv(all_entities, args.output_dir, "focal_entities.csv")
         logger.info(f"已保存 {len(all_entities)} 个焦点实体")
         print(f"已保存 {len(all_entities)} 个焦点实体")
-        
-        # 释放内存 - 我们不再需要完整的节点数据
-        del nodes_data
-        gc.collect()
         
         # 提取关系
         logger.info("提取关系...")
@@ -889,7 +749,7 @@ def run_extraction(args):
         del db_data
         gc.collect()
         
-        # 提取PubMed关系 - 修改后的部分，使用新的并行和流处理方法
+        # 提取PubMed关系 - 修改后的部分
         logger.info("提取PubMed关系...")
         pubmed_file = os.path.join(args.data_dir, "PubMedList.json")
         print(f"尝试加载PubMed文件: {pubmed_file}")
@@ -901,22 +761,22 @@ def run_extraction(args):
         try:
             # 创建一个更加聚焦的实体结构
             simple_focal_entities = {
-                'drug': [entity["Original ID"] for entity in drug_entities] if 'drug_entities' in locals() else [],
-                'disease': [entity["Original ID"] for entity in disease_entities] if 'disease_entities' in locals() else []
+                'drug': [entity["Original ID"] for entity in drug_entities],
+                'disease': [entity["Original ID"] for entity in disease_entities]
             }
             
-            # 尝试使用并行流处理方法
-            pubmed_relations, entity_connections = process_pubmed_relations_parallel(
+            # 首先尝试使用改进的字符级解析方法
+            pubmed_relations, entity_connections = process_pubmed_relations(
                 pubmed_file,
                 focal_ids,
                 simple_focal_entities,
                 relation_schema
             )
             
-            # 如果没有找到关系，尝试优化的简单处理方法
+            # 如果没有找到关系，尝试使用简单备用方法
             if not pubmed_relations:
-                print("使用并行流处理未找到关系，尝试优化的简单处理方法...")
-                pubmed_relations, entity_connections = simple_pubmed_processing_optimized(
+                print("使用字符级解析未找到关系，尝试简单处理方法...")
+                pubmed_relations, entity_connections = simple_pubmed_processing(
                     pubmed_file,
                     focal_ids,
                     simple_focal_entities,
@@ -935,70 +795,44 @@ def run_extraction(args):
         logger.info(f"共提取了 {len(all_relations)} 条关系")
         print(f"共提取了 {len(all_relations)} 条关系")
 
-        # 高效处理关系ID并保存
+        # 直接处理关系ID并保存
         if all_relations:
-            # 创建并行映射函数
-            def assign_entity_ids(focal_ids, all_relations):
-                entity_mapping = {}
-                next_id = 1
-                
-                # 首先为焦点实体分配ID
-                for focal_id in focal_ids:
-                    entity_mapping[focal_id] = next_id
+            # 创建一个简单的自动ID映射函数
+            print("使用自动ID映射...")
+            # 为源和目标实体分配新的ID
+            entity_mapping = {}
+            next_id = 1
+    
+            # 首先为焦点实体分配ID
+            for focal_id in focal_ids:
+                entity_mapping[focal_id] = next_id
+                next_id += 1
+    
+            # 再为关系中涉及的其他实体分配ID
+            for relation in all_relations:
+                source_id = relation.get("Original Source ID")
+                target_id = relation.get("Original Target ID")
+        
+                if source_id and source_id not in entity_mapping:
+                    entity_mapping[source_id] = next_id
                     next_id += 1
-                
-                # 收集所有需要分配ID的实体
-                entity_ids = set()
-                for relation in all_relations:
-                    source_id = relation.get("Original Source ID")
-                    target_id = relation.get("Original Target ID")
-                    
-                    if source_id and source_id not in entity_mapping:
-                        entity_ids.add(source_id)
-                    
-                    if target_id and target_id not in entity_mapping:
-                        entity_ids.add(target_id)
-                
-                # 为其他实体分配ID
-                for entity_id in entity_ids:
-                    entity_mapping[entity_id] = next_id
+            
+                if target_id and target_id not in entity_mapping:
+                    entity_mapping[target_id] = next_id
                     next_id += 1
-                
-                return entity_mapping
-            
-            # 分配实体ID
-            print("使用高效ID映射...")
-            entity_mapping = assign_entity_ids(focal_ids, all_relations)
-            
-            # 使用并行处理批量更新关系
-            def update_relation_batch(relations_batch, entity_mapping):
-                updated_batch = []
-                for relation in relations_batch:
-                    source_id = relation.get("Original Source ID")
-                    target_id = relation.get("Original Target ID")
-                    
-                    if source_id in entity_mapping and target_id in entity_mapping:
-                        relation_copy = relation.copy()
-                        relation_copy["Source ID"] = entity_mapping[source_id]
-                        relation_copy["Target ID"] = entity_mapping[target_id]
-                        updated_batch.append(relation_copy)
-                
-                return updated_batch
-            
-            # 将关系分成多个批次
-            batch_size = max(1, len(all_relations) // (MAX_WORKERS * 2))
-            relation_batches = [all_relations[i:i+batch_size] for i in range(0, len(all_relations), batch_size)]
-            
-            # 并行处理每个批次
+    
+            # 更新关系的实体ID
             updated_relations = []
-            with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
-                # 准备函数和参数
-                func = partial(update_relation_batch, entity_mapping=entity_mapping)
-                
-                # 并行执行批处理
-                for batch_result in tqdm(executor.map(func, relation_batches), total=len(relation_batches), desc="更新关系ID"):
-                    updated_relations.extend(batch_result)
-            
+            for relation in all_relations:
+                source_id = relation.get("Original Source ID")
+                target_id = relation.get("Original Target ID")
+        
+                if source_id in entity_mapping and target_id in entity_mapping:
+                    relation_copy = relation.copy()
+                    relation_copy["Source ID"] = entity_mapping[source_id]
+                    relation_copy["Target ID"] = entity_mapping[target_id]
+                    updated_relations.append(relation_copy)
+    
             print(f"自动映射了 {len(entity_mapping)} 个实体ID")
             print(f"更新了 {len(updated_relations)} 条关系的实体ID")
     
@@ -1006,7 +840,7 @@ def run_extraction(args):
             save_relations_to_csv(updated_relations, args.output_dir)
             print(f"保存了 {len(updated_relations)} 条关系")
         
-        # 提取关联实体 - 使用并行处理优化这一部分
+        # 提取关联实体
         logger.info("提取相关实体...")
         print("开始提取相关实体...")
         
@@ -1021,44 +855,13 @@ def run_extraction(args):
         logger.info(f"发现 {len(related_ids)} 个相关实体")
         print(f"发现 {len(related_ids)} 个相关实体")
         
-        # 重新加载实体数据 - 只有在需要时才加载
+        # 提取相关实体
         if related_ids:
-            logger.info("重新加载实体数据以提取相关实体...")
-            nodes_data = load_json_file(
-                nodes_file,
-                chunk_size=args.chunk_size,
-                low_memory=args.low_memory,
-                method='auto'
+            related_entities, related_id_map = extract_entities_by_ids(
+                nodes_data,
+                list(related_ids),
+                args.entity_types if args.entity_types else None
             )
-            
-            if not nodes_data:
-                logger.error("重新加载实体数据失败")
-                # 继续使用已有的焦点实体
-                related_entities = []
-                related_id_map = {}
-            else:
-                # 为了提高效率，先按ID过滤节点
-                filtered_nodes = []
-                related_ids_set = set(related_ids)  # 转换为集合以加快查找
-                
-                for node in tqdm(nodes_data, desc="预过滤相关实体"):
-                    if isinstance(node, dict) and node.get("biokdeid") in related_ids_set:
-                        if not args.entity_types or node.get("type") in args.entity_types:
-                            filtered_nodes.append(node)
-                
-                print(f"预过滤后的相关实体节点数: {len(filtered_nodes)}")
-                
-                # 提取相关实体
-                related_entities, related_id_map = extract_entities_by_ids(
-                    filtered_nodes,
-                    list(related_ids),
-                    args.entity_types if args.entity_types else None
-                )
-                
-                # 释放内存
-                del nodes_data
-                del filtered_nodes
-                gc.collect()
             
             # 保存相关实体
             save_entities_to_csv(related_entities, args.output_dir, "related_entities.csv")
@@ -1082,9 +885,9 @@ def run_extraction(args):
     
     except Exception as e:
         print(f"严重错误: {e}")
-        print(tb.format_exc())
+        print(tb.format_exc())  # 使用tb而不是traceback
         logger.error(f"数据提取过程中发生错误: {e}")
-        logger.error(tb.format_exc())
+        logger.error(tb.format_exc())  # 使用tb而不是traceback
         return False
 
 def main():
@@ -1110,21 +913,10 @@ def main():
 
 if __name__ == "__main__":
     try:
-        # 设置进程启动方法
-        if sys.platform.startswith('win'):
-            # Windows下使用'spawn'方法
-            mp.set_start_method('spawn', force=True)
-        else:
-            # Unix系统使用'fork'方法
-            try:
-                mp.set_start_method('fork', force=True)
-            except RuntimeError:
-                pass  # 可能已经设置
-        
         # 顶层输出只打印一次
         print("数据提取脚本启动...")
         sys.exit(main())
     except Exception as e:
         print(f"CRITICAL ERROR: {e}")
-        print(tb.format_exc())
+        print(tb.format_exc())  # 使用tb而不是traceback
         sys.exit(1)
