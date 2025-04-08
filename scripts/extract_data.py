@@ -227,45 +227,28 @@ def run_extraction(args):
         pubmed_file = os.path.join(args.data_dir, "PubMedList.json")
         print(f"尝试加载PubMed关系文件: {pubmed_file}")
         print(f"文件存在: {os.path.exists(pubmed_file)}")
-        
-        # 由于PubMed文件通常很大，使用流式处理
+
         try:
-            # Modified code with better chunking
-            pubmed_relations = []
-            # Use a much larger chunk size specifically for PubMed
-            pubmed_chunk_size = args.chunk_size * 100  # 100x larger chunks
-
-            print(f"开始加载PubMed关系文件，使用块大小: {pubmed_chunk_size}")
-            chunks_processed = 0
-            relations_found = 0
-
-            for chunk in tqdm(load_json_file(pubmed_file, chunk_size=pubmed_chunk_size, method='stream'), desc="处理PubMed关系"):
-                if chunk is None or not chunk:
-                    continue
+            # 跳过整个PubMed流式处理，转而使用batch_main_xin_4_7.py中的并行处理方法
+            from core.data_loader import parallel_process_pubmed_relations
     
-                chunks_processed += 1
-                chunk_size = len(chunk)
+            # 创建一个更简单的focal_entities结构
+            simple_focal_entities = {
+                'drug': [entity["Original ID"] for entity in drug_entities],
+                'disease': [entity["Original ID"] for entity in disease_entities]
+            }
     
-                # Only print status every 10 chunks to reduce console spam
-                if chunks_processed % 10 == 0:
-                    print(f"正在处理第 {chunks_processed} 个PubMed关系块，大小: {chunk_size}")
+            num_processes = min(12, os.cpu_count())  # 限制进程数以避免内存问题
+            pubmed_relations, _ = parallel_process_pubmed_relations(
+                pubmed_file,
+                focal_ids,
+                simple_focal_entities,
+                relation_schema,
+                num_processes=num_processes,
+                chunk_size=args.chunk_size,
+                buffer_size=50*1024*1024  # 50MB缓冲区
+            )
     
-                chunk_relations = extract_relations_with_entities(
-                    chunk,
-                    focal_ids,
-                    relation_schema
-                )
-    
-                pubmed_relations.extend(chunk_relations)
-                relations_found += len(chunk_relations)
-    
-                # Only print status every 10 chunks
-                if chunks_processed % 10 == 0:
-                    print(f"当前已提取 {relations_found} 条PubMed关系")
-
-            logger.info(f"提取了 {len(pubmed_relations)} 条PubMed关系")
-            print(f"提取了 {len(pubmed_relations)} 条PubMed关系")
-            
             logger.info(f"提取了 {len(pubmed_relations)} 条PubMed关系")
             print(f"提取了 {len(pubmed_relations)} 条PubMed关系")
         except Exception as e:
@@ -278,36 +261,60 @@ def run_extraction(args):
         all_relations = db_relations + pubmed_relations
         logger.info(f"共提取了 {len(all_relations)} 条关系")
         print(f"共提取了 {len(all_relations)} 条关系")
+
+        # 直接处理关系ID并保存
+        if all_relations:
+            # 创建一个简单的自动ID映射函数
+            print("使用自动ID映射...")
+            # 为源和目标实体分配新的ID
+            entity_mapping = {}
+            next_id = 1
+    
+            # 首先为焦点实体分配ID
+            for focal_id in focal_ids:
+                entity_mapping[focal_id] = next_id
+                next_id += 1
+    
+            # 再为关系中涉及的其他实体分配ID
+            for relation in all_relations:
+                source_id = relation.get("Original Source ID")
+                target_id = relation.get("Original Target ID")
         
-        if not all_relations:
-            print("没有找到任何关系，保存空的关系文件")
-            save_relations_to_csv([], args.output_dir)
-            save_entities_to_csv(all_entities, args.output_dir, "all_entities.csv")
-            logger.info("完成保存实体和空关系")
-            return True
+                if source_id and source_id not in entity_mapping:
+                    entity_mapping[source_id] = next_id
+                    next_id += 1
+            
+                if target_id and target_id not in entity_mapping:
+                    entity_mapping[target_id] = next_id
+                    next_id += 1
+    
+            # 更新关系的实体ID
+            updated_relations = []
+            for relation in all_relations:
+                source_id = relation.get("Original Source ID")
+                target_id = relation.get("Original Target ID")
         
-        # 更新关系的实体ID
-        updated_relations = update_relation_entity_ids(all_relations, entity_id_map)
-        logger.info(f"更新了 {len(updated_relations)} 条关系的实体ID")
-        print(f"更新了 {len(updated_relations)} 条关系的实体ID")
-        
-        # 添加实体名称
-        relations_with_names = add_entity_names_to_relations(
-            updated_relations,
-            pd.DataFrame(all_entities)
-        )
-        
-        # 保存关系
-        save_relations_to_csv(relations_with_names, args.output_dir)
-        print(f"已保存 {len(relations_with_names)} 条关系")
+                if source_id in entity_mapping and target_id in entity_mapping:
+                    relation_copy = relation.copy()
+                    relation_copy["Source ID"] = entity_mapping[source_id]
+                    relation_copy["Target ID"] = entity_mapping[target_id]
+                    updated_relations.append(relation_copy)
+    
+            print(f"自动映射了 {len(entity_mapping)} 个实体ID")
+            print(f"更新了 {len(updated_relations)} 条关系的实体ID")
+    
+            # 保存关系
+            save_relations_to_csv(updated_relations, args.output_dir)
+            print(f"保存了 {len(updated_relations)} 条关系")
         
         # 提取关联实体
         logger.info("提取相关实体...")
         print("开始提取相关实体...")
         
         # 收集所有相关的实体ID
+        # 收集所有相关的实体ID
         related_ids = set()
-        for relation in relations_with_names:
+        for relation in updated_relations:  # Use updated_relations instead
             related_ids.add(relation["Original Source ID"])
             related_ids.add(relation["Original Target ID"])
         
@@ -381,4 +388,7 @@ if __name__ == "__main__":
         import traceback
         print(traceback.format_exc())
         sys.exit(1)
+
+
+
 

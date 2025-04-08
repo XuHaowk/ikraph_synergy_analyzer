@@ -47,7 +47,7 @@ def load_json_file(file_path, chunk_size=None, low_memory=False, method='auto'):
         if rapidjson is not None:
             # Configure RapidJSON options
             parse_options = rapidjson.PM_TRAILING_COMMAS | rapidjson.PM_COMMENTS | rapidjson.PM_NONE
-            
+            mmap_block_size = 104857600  # 100MB
             # For smaller files, load directly
             if file_size < 500:  # Less than 500MB
                 with open(file_path, 'rb') as f:
@@ -481,3 +481,261 @@ def enable_large_dataset_processing():
     
     logger.info("系统已配置为处理大型数据集") 
 
+def process_pubmed_chunk_rapidjson(start_pos, end_pos, file_path, focal_ids, focal_entities, relation_schema, buffer_size):
+    """Process a chunk of the PubMed file with RapidJSON for maximum speed with enhanced error handling"""
+    import rapidjson
+    from core.relation_extractor import extract_single_pubmed_relation_rapidjson
+    
+    result_relations = []
+    # Initialize entity connections dictionary
+    chunk_entity_connections = {
+        'drug': {drug_id: set() for drug_id in focal_entities.get('drug', [])},
+        'disease': {disease_id: set() for disease_id in focal_entities.get('disease', [])}
+    }
+    
+    try:
+        with open(file_path, 'rb') as f:
+            # Use a smaller buffer size to avoid memory issues
+            working_buffer_size = min(buffer_size, 5*1024*1024)  # Limit to 5MB chunks
+            
+            # Skip to the start position with error handling
+            try:
+                f.seek(start_pos)
+            except OSError:
+                # If seeking directly fails, try incremental approach
+                f.seek(0)
+                remaining = start_pos
+                chunk_size = 1024 * 1024  # 1MB chunks
+                while remaining > 0:
+                    to_skip = min(remaining, chunk_size)
+                    f.read(to_skip)
+                    remaining -= to_skip
+            
+            # Find the next object boundary if not at start
+            if start_pos > 0:
+                # Find the beginning of a valid JSON object by looking for '{'
+                chars_to_check = 1000  # limit how far we search
+                found_start = False
+                search_buffer = b''
+                
+                for _ in range(chars_to_check):
+                    char = f.read(1)
+                    if not char:
+                        break
+                    search_buffer += char
+                    if char == b'{':
+                        f.seek(f.tell() - 1)  # Move back to include the '{'
+                        found_start = True
+                        break
+                
+                if not found_start:
+                    # No valid start found, return empty results
+                    return result_relations, chunk_entity_connections
+            
+            # Process until reaching end position or EOF
+            current_pos = f.tell()
+            object_count = 0
+            
+            # Initialize parsing state
+            current_object = bytearray()
+            depth = 0
+            in_object = False
+            in_string = False
+            escape_next = False
+            
+            while current_pos < end_pos:
+                try:
+                    # Read a smaller chunk of data to avoid memory errors
+                    read_size = min(working_buffer_size, end_pos - current_pos)
+                    buffer = f.read(read_size)
+                    if not buffer:
+                        break
+                    
+                    # Process each byte in the buffer
+                    i = 0
+                    while i < len(buffer):
+                        byte = buffer[i]
+                        i += 1
+                        
+                        # Handle string escape sequences
+                        if escape_next:
+                            escape_next = False
+                            current_object.append(byte)
+                            continue
+                        
+                        # Handle string literals (ignore braces inside strings)
+                        if in_string:
+                            if byte == 92:  # backslash
+                                escape_next = True
+                            elif byte == 34:  # double quote
+                                in_string = False
+                            current_object.append(byte)
+                            continue
+                        
+                        if byte == 34:  # double quote
+                            in_string = True
+                            current_object.append(byte)
+                            continue
+                        
+                        # Handle object boundaries
+                        if byte == 123:  # opening brace {
+                            if not in_object:
+                                in_object = True
+                                current_object = bytearray([byte])
+                            else:
+                                current_object.append(byte)
+                            depth += 1
+                        elif byte == 125:  # closing brace }
+                            depth -= 1
+                            current_object.append(byte)
+                            
+                            # Complete object found
+                            if depth == 0 and in_object:
+                                try:
+                                    # Parse with RapidJSON for maximum speed
+                                    item = rapidjson.loads(current_object)
+                                    
+                                    # Check if this relation involves focal entities
+                                    if isinstance(item, dict) and "id" in item:
+                                        rel_id = item["id"]
+                                        from core.relation_extractor import parse_relation_id
+                                        rel_components = parse_relation_id(rel_id, relation_schema)
+                                        
+                                        if rel_components:
+                                            source_id = rel_components["source_id"]
+                                            target_id = rel_components["target_id"]
+                                            
+                                            # Check if related to focal entities
+                                            if source_id in focal_ids or target_id in focal_ids:
+                                                # Extract relationship details
+                                                extracted_relations = extract_single_pubmed_relation_rapidjson(item, relation_schema)
+                                                result_relations.extend(extracted_relations)
+                                                
+                                                # Track connected entity for each focal entity
+                                                connected_entity_id = target_id if source_id in focal_ids else source_id
+                                                focal_entity_id = source_id if source_id in focal_ids else target_id
+                                                
+                                                # Track for drug focal entities
+                                                if focal_entity_id in focal_entities.get('drug', []):
+                                                    chunk_entity_connections['drug'][focal_entity_id].add(connected_entity_id)
+                                                
+                                                # Track for disease focal entities
+                                                if focal_entity_id in focal_entities.get('disease', []):
+                                                    chunk_entity_connections['disease'][focal_entity_id].add(connected_entity_id)
+                                    
+                                    object_count += 1
+                                    
+                                    # Periodically free memory - more frequent than before
+                                    if object_count % 25000 == 0:  # Was 100000, now more frequent
+                                        gc.collect()
+                                    
+                                except Exception as e:
+                                    # More graceful handling of parsing errors
+                                    pass
+                                
+                                # Reset state
+                                in_object = False
+                                current_object = bytearray()
+                        elif in_object:
+                            current_object.append(byte)
+                    
+                    # Update current position
+                    current_pos = f.tell()
+                    
+                    # Periodically free memory
+                    if current_pos % (5 * 1024 * 1024) == 0:  # Every 5MB
+                        gc.collect()
+                        
+                except MemoryError:
+                    # If we hit a memory error, try to recover by clearing our buffers
+                    current_object = bytearray()
+                    in_object = False
+                    depth = 0
+                    gc.collect()
+                    
+                    # Try to skip ahead a bit and continue
+                    try:
+                        f.seek(min(f.tell() + 1024, end_pos))  # Skip ahead 1KB
+                        current_pos = f.tell()
+                    except:
+                        # If seeking fails, just break out of the loop
+                        break
+    
+    except Exception as e:
+        # Capture and log any exceptions
+        return result_relations, chunk_entity_connections
+    
+    return result_relations, chunk_entity_connections
+def parallel_process_pubmed_relations(file_path, focal_ids, focal_entities, relation_schema, num_processes=24, chunk_size=100000, buffer_size=50*1024*1024):
+    """Parallel process PubMed relation data with improved chunking and error handling"""
+    import multiprocessing as mp
+    
+    logger.info(f"Starting parallel processing with RapidJSON: {num_processes} processes, buffer: {buffer_size/1024/1024:.1f}MB")
+    
+    # Calculate file size and divide into smaller chunks for better memory management
+    file_size = os.path.getsize(file_path)
+    
+    # Use smaller chunks to prevent memory errors - 25MB chunks instead of evenly dividing file
+    chunk_size_bytes = 25 * 1024 * 1024  # 25MB chunks
+    num_chunks = (file_size // chunk_size_bytes) + 1
+    
+    # Limit number of chunks to number of processes to avoid overhead
+    if num_chunks < num_processes:
+        chunk_size_bytes = file_size // num_processes
+        num_chunks = num_processes
+    
+    # Create chunk positions
+    chunk_positions = []
+    for i in range(num_chunks):
+        start_pos = i * chunk_size_bytes
+        end_pos = min((i + 1) * chunk_size_bytes, file_size)
+        
+        # Use reduced buffer size to prevent memory errors
+        actual_buffer_size = min(buffer_size, chunk_size_bytes // 4)
+        
+        chunk_positions.append((start_pos, end_pos, file_path, focal_ids, focal_entities, relation_schema, actual_buffer_size))
+    
+    # Limit chunks to available processes
+    logger.info(f"Processing file in {len(chunk_positions)} chunks")
+    
+    # Use the process pool with error handling
+    all_relations = []
+    combined_connections = {
+        'drug': {drug_id: set() for drug_id in focal_entities.get('drug', [])},
+        'disease': {disease_id: set() for disease_id in focal_entities.get('disease', [])}
+    }
+    
+    # Process chunks in batches to better manage memory
+    batch_size = max(1, num_processes // 2)  # Process half the chunks at a time
+    
+    for i in range(0, len(chunk_positions), batch_size):
+        batch_chunks = chunk_positions[i:i+batch_size]
+        
+        try:
+            with mp.Pool(processes=min(num_processes, len(batch_chunks))) as pool:
+                results = pool.starmap(process_pubmed_chunk_rapidjson, batch_chunks)
+                
+                # Process results from this batch
+                for relations, connections in results:
+                    if relations:  # Only process if we got valid relations
+                        all_relations.extend(relations)
+                        
+                        # Merge entity connections
+                        for entity_type in ['drug', 'disease']:
+                            for entity_id, connected_ids in connections[entity_type].items():
+                                combined_connections[entity_type][entity_id].update(connected_ids)
+                
+                # Force cleanup to prevent memory leaks
+                pool.close()
+                pool.join()
+                
+            # Explicitly garbage collect between batches
+            gc.collect()
+            
+        except Exception as e:
+            logger.error(f"Error processing batch {i//batch_size}: {e}")
+            # Continue with the next batch
+    
+    logger.info(f"Extracted {len(all_relations)} relations from PubMed")
+    
+    return all_relations, combined_connections

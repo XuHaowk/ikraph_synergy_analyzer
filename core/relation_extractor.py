@@ -78,6 +78,97 @@ def extract_relations_with_entities(relations_data, entity_ids, relation_schema=
     """
     logger.info(f"提取涉及特定实体的关系: 实体数量={len(entity_ids)}")
     
+    # 特殊处理PubMed格式
+    if isinstance(relations_data, list) and len(relations_data) > 0 and isinstance(relations_data[0], dict) and "id" in relations_data[0] and "list" in relations_data[0]:
+        logger.info("检测到PubMed格式数据，使用专用提取逻辑")
+        matched_relations = []
+        
+        # 创建实体ID集合用于快速查找
+        entity_id_set = set(entity_ids)
+        
+        # 记录未映射的关系类型ID，用于调试
+        unmapped_relation_types = set()
+        
+        for item in tqdm(relations_data, desc="处理PubMed关系"):
+            rel_id = item.get("id")
+            rel_data = item.get("list", [])
+            
+            # 跳过格式不正确的条目
+            if not rel_id or not isinstance(rel_id, str) or not rel_data:
+                continue
+                
+            # 解析关系ID
+            parts = rel_id.split(".")
+            if len(parts) < 2:
+                continue
+                
+            source_id = parts[0]
+            target_id = parts[1]
+            
+            # 检查此关系是否涉及我们感兴趣的实体
+            if source_id not in entity_id_set and target_id not in entity_id_set:
+                continue
+                
+            # 提取关系类型
+            relation_type_id = parts[2] if len(parts) > 2 else "Unknown"
+            relation_type = "Unknown"
+            
+            # 如果有关系模式，尝试解析关系类型
+            if relation_schema and relation_type_id in relation_schema:
+                if isinstance(relation_schema[relation_type_id], dict) and "name" in relation_schema[relation_type_id]:
+                    relation_type = relation_schema[relation_type_id]["name"]
+            
+            if relation_type == "Unknown":
+                unmapped_relation_types.add(relation_type_id)
+            
+            # 处理所有条目
+            for entry in rel_data:
+                if len(entry) >= 3:
+                    # 提取得分和置信度，增强错误处理
+                    try:
+                        score = float(entry[0]) if entry[0] is not None and entry[0] != "" else 0.0
+                        document = str(entry[1]) if len(entry) > 1 and entry[1] is not None else ""
+                        confidence = float(entry[2]) if len(entry) > 2 and entry[2] is not None and entry[2] != "" else 0.0
+                        
+                        # 可选的新颖性字段
+                        novelty = None
+                        if len(entry) > 3 and entry[3] is not None:
+                            try:
+                                novelty = int(entry[3])
+                            except (ValueError, TypeError):
+                                pass
+                    except (ValueError, TypeError):
+                        # 跳过无效数据
+                        continue
+                    
+                    # 检查置信度阈值
+                    if min_confidence > 0 and confidence < min_confidence:
+                        continue
+                    
+                    # 创建关系记录
+                    relation = {
+                        "Original Source ID": source_id,
+                        "Original Target ID": target_id,
+                        "Relation Type": relation_type,
+                        "Relation Type ID": relation_type_id,
+                        "Confidence": confidence,
+                        "Score": score,
+                        "Document": document,
+                        "Source": "PubMed"
+                    }
+                    
+                    if novelty is not None:
+                        relation["Novelty"] = novelty
+                        
+                    matched_relations.append(relation)
+        
+        # 报告未映射的关系类型
+        if unmapped_relation_types:
+            logger.warning(f"发现 {len(unmapped_relation_types)} 个未映射的关系类型ID: {list(unmapped_relation_types)[:10]}")
+            
+        logger.info(f"从PubMed格式数据中提取了 {len(matched_relations)} 条关系")
+        return matched_relations
+    
     # 潜在的源ID和目标ID键名列表
     source_id_keys = [
         'Original Source ID', 'source_id', 'node_one_id', 
@@ -292,6 +383,7 @@ def extract_single_pubmed_relation_rapidjson(relation_item, relation_schema):
     
     except Exception as e:
         # Log the error and return empty results
+        logger.error(f"Error extracting relation: {e}")
         return []
     
     return results
@@ -850,3 +942,5 @@ def filter_relations_by_entity_types(relations, entity_type_pairs):
     
     logger.info(f"按实体类型对过滤: 从 {len(relations)} 条关系中筛选出 {len(filtered)} 条")
     return filtered 
+
+
