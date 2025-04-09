@@ -18,6 +18,8 @@ import multiprocessing as mp
 import traceback as tb  # 重命名为tb避免作用域冲突
 from tqdm import tqdm
 from datetime import datetime
+from concurrent.futures import ProcessPoolExecutor
+from functools import partial
 
 # 尝试导入rapidjson，如果不可用则使用标准json
 try:
@@ -37,9 +39,6 @@ from core.relation_extractor import extract_relations_with_entities, update_rela
 from utils.file_utils import check_directories, save_entities_to_csv, save_relations_to_csv
 
 logger = logging.getLogger(__name__)
-
-# 设置批处理大小
-BATCH_SIZE = 100000  # 积累100,000个对象再处理
 
 def clean_non_ascii_chars(text, preserve_greek=False):
     """
@@ -280,9 +279,6 @@ def process_found_objects(objects_list, focal_ids, focal_entities, relation_sche
     """处理找到的JSON对象并提取关系"""
     relation_count = 0
     
-    # 创建焦点ID集合以加速查找
-    focal_ids_set = set(focal_ids)
-    
     for obj_text in objects_list:
         try:
             # 解析JSON对象
@@ -302,7 +298,7 @@ def process_found_objects(objects_list, focal_ids, focal_entities, relation_sche
             relation_type = rel_id_parts[2]
             
             # 检查是否与焦点实体相关
-            if source_id in focal_ids_set or target_id in focal_ids_set:
+            if source_id in focal_ids or target_id in focal_ids:
                 # 获取关系类型名称
                 relation_type_name = relation_schema.get(relation_type)
                 
@@ -345,19 +341,19 @@ def process_found_objects(objects_list, focal_ids, focal_entities, relation_sche
                             elif target_id == disease_id and source_id != disease_id:
                                 entity_connections['disease'][disease_id].add(source_id)
         
-        except json.JSONDecodeError:
-            pass  # 忽略解析错误，继续处理下一个对象
+        except json.JSONDecodeError as e:
+            print(f"警告: 无法解析JSON对象: {e}")
         except Exception as e:
-            pass  # 忽略所有错误，提高处理速度
+            print(f"处理对象时出错: {e}")
     
     if relation_count > 0:
         print(f"在当前批次中找到 {relation_count} 个关系")
 
 def process_pubmed_relations(file_path, focal_ids, focal_entities, relation_schema):
     """
-    使用字符级解析处理PubMed关系数据，积累100,000个对象再处理
+    使用字符级解析处理PubMed关系数据，适应任意格式的JSON数组
     """
-    print(f"使用大批量处理PubMed关系（每批 {BATCH_SIZE:,} 个对象）...")
+    print("使用改进的字符级解析方法处理PubMed关系...")
     
     extracted_relations = []
     entity_connections = {
@@ -366,11 +362,6 @@ def process_pubmed_relations(file_path, focal_ids, focal_entities, relation_sche
     }
     
     try:
-        # 获取文件大小以估计总进度
-        file_size = os.path.getsize(file_path)
-        start_time = datetime.now()
-        print(f"文件大小: {file_size/1024/1024:.2f} MB")
-        
         # 读取文件的前100个字符来检测格式
         with open(file_path, 'r', encoding='utf-8') as f:
             prefix = f.read(100)
@@ -382,362 +373,59 @@ def process_pubmed_relations(file_path, focal_ids, focal_entities, relation_sche
         
         # 使用字符级解析
         with open(file_path, 'r', encoding='utf-8') as f:
-            # 跳过文件开头的'['
-            if f.read(1) != '[':
-                f.seek(0)  # 重置到文件开头
+            content = f.read()
             
-            # 跟踪状态变量
-            objects_found = []
-            bracket_depth = 0
-            in_object = False
-            in_string = False
-            escape_next = False
-            start_pos = 0
-            
-            total_objects = 0
-            total_processed_bytes = 0
-            last_report_time = datetime.now()
-            last_report_objects = 0
-            
-            # 每次读取5MB数据进行处理
-            chunk_size = 5 * 1024 * 1024
-            
-            while True:
-                # 读取一块数据
-                chunk = f.read(chunk_size)
-                if not chunk:  # 文件结束
-                    break
-                
-                total_processed_bytes += len(chunk)
-                
-                # 逐字符分析，识别完整的JSON对象
-                for i, char in enumerate(chunk):
-                    # 处理字符串中的字符
-                    if in_string:
-                        if escape_next:
-                            escape_next = False
-                        elif char == '\\':
-                            escape_next = True
-                        elif char == '"':
-                            in_string = False
-                        continue
-                    
-                    # 处理非字符串内容
-                    if char == '"':
-                        in_string = True
-                    elif char == '{':
-                        if bracket_depth == 0:
-                            # 这是一个新对象的开始
-                            start_pos = total_processed_bytes - len(chunk) + i
-                            in_object = True
-                        bracket_depth += 1
-                    elif char == '}':
-                        bracket_depth -= 1
-                        if bracket_depth == 0 and in_object:
-                            # 找到了一个完整的JSON对象
-                            end_pos = total_processed_bytes - len(chunk) + i + 1
-                            
-                            # 读取对象内容
-                            f.seek(start_pos)
-                            obj_text = f.read(end_pos - start_pos)
-                            f.seek(total_processed_bytes)  # 回到当前位置
-                            
-                            objects_found.append(obj_text)
-                            total_objects += 1
-                            in_object = False
-                            
-                            # 定期报告进度
-                            current_time = datetime.now()
-                            time_diff = (current_time - last_report_time).total_seconds()
-                            
-                            if time_diff >= 5:  # 每5秒报告一次进度
-                                elapsed_time = (current_time - start_time).total_seconds()
-                                percent_complete = total_processed_bytes / file_size * 100
-                                objects_per_second = (total_objects - last_report_objects) / time_diff
-                                
-                                print(f"进度: {percent_complete:.1f}% | 已处理: {total_objects:,} 个对象 | "
-                                      f"速率: {objects_per_second:.1f} 对象/秒 | "
-                                      f"已用时间: {elapsed_time:.0f}秒")
-                                
-                                last_report_time = current_time
-                                last_report_objects = total_objects
-                            
-                            # 为了避免内存问题，当积累了100,000个对象时处理它们
-                            if len(objects_found) >= BATCH_SIZE:
-                                print(f"批量处理 {len(objects_found):,} 个对象...")
-                                process_found_objects(objects_found, focal_ids, focal_entities, 
-                                                      relation_schema, extracted_relations, entity_connections)
-                                objects_found = []  # 清空对象列表
-                                gc.collect()  # 强制垃圾回收
-                
-                # 如果块结束时我们正在处理一个对象，需要调整文件指针
-                if in_object:
-                    # 回退到起始位置
-                    f.seek(start_pos)
-                    total_processed_bytes = start_pos
-                    # 重置状态
-                    in_object = False
-                    bracket_depth = 0
-                    in_string = False
+        # 跟踪状态变量
+        objects_found = []
+        bracket_depth = 0
+        in_object = False
+        in_string = False
+        escape_next = False
+        start_pos = 0
+        
+        # 逐字符分析，识别完整的JSON对象
+        for i, char in enumerate(content):
+            # 处理字符串中的字符
+            if in_string:
+                if escape_next:
                     escape_next = False
-        
-            # 处理剩余的对象
-            if objects_found:
-                print(f"处理剩余的 {len(objects_found):,} 个对象...")
-                process_found_objects(objects_found, focal_ids, focal_entities, relation_schema, 
-                                      extracted_relations, entity_connections)
-        
-        # 计算和报告总处理时间
-        end_time = datetime.now()
-        elapsed_time = (end_time - start_time).total_seconds()
-        print(f"PubMed处理完成，找到 {len(extracted_relations):,} 个关系")
-        print(f"总处理时间: {elapsed_time:.1f}秒 | "
-              f"平均速率: {total_objects/elapsed_time:.1f} 对象/秒")
-    
-    except Exception as e:
-        print(f"处理PubMed文件时出错: {e}")
-        print(tb.format_exc())
-    
-    return extracted_relations, entity_connections
-
-def efficient_pubmed_processing(file_path, focal_ids, focal_entities, relation_schema):
-    """
-    高效处理PubMed关系数据 - 使用流式解析和大批量处理
-    """
-    print(f"使用高效流式处理方法处理PubMed关系（每批 {BATCH_SIZE:,} 个对象）...")
-    
-    extracted_relations = []
-    entity_connections = {
-        'drug': {drug_id: set() for drug_id in focal_entities.get('drug', [])},
-        'disease': {disease_id: set() for disease_id in focal_entities.get('disease', [])}
-    }
-    
-    # 创建焦点ID集合用于快速查找
-    focal_ids_set = set(focal_ids)
-    print(f"Focal IDs数量: {len(focal_ids_set)}")
-    
-    # 状态跟踪变量
-    relation_count = 0
-    object_count = 0
-    start_time = datetime.now()
-    last_report_time = start_time
-    last_report_objects = 0
-    
-    # 创建一个缓冲区来存储对象，直到积累到足够多
-    objects_buffer = []
-    
-    try:
-        # 获取文件大小以计算进度
-        file_size = os.path.getsize(file_path)
-        print(f"文件大小: {file_size/1024/1024:.2f} MB")
-        
-        with open(file_path, 'r', encoding='utf-8') as f:
-            # 跳过文件开头的'['
-            first_char = f.read(1)
-            if first_char != '[':
-                f.seek(0)  # 重置到文件开头
+                elif char == '\\':
+                    escape_next = True
+                elif char == '"':
+                    in_string = False
+                continue
             
-            # 读取并处理文件
-            json_buffer = ""
-            in_object = False
-            bracket_depth = 0
-            in_string = False
-            escape_next = False
-            total_processed_bytes = 1  # 初始为1，因为已经读取了第一个字符
-            
-            # 设置读取缓冲区大小 - 每次读取5MB
-            chunk_size = 5 * 1024 * 1024
-            
-            while True:
-                chunk = f.read(chunk_size)
-                if not chunk:  # 文件结束
-                    break
-                
-                total_processed_bytes += len(chunk)
-                
-                # 处理当前块
-                i = 0
-                while i < len(chunk):
-                    char = chunk[i]
-                    i += 1
+            # 处理非字符串内容
+            if char == '"':
+                in_string = True
+            elif char == '{':
+                if bracket_depth == 0:
+                    start_pos = i
+                    in_object = True
+                bracket_depth += 1
+            elif char == '}':
+                bracket_depth -= 1
+                if bracket_depth == 0 and in_object:
+                    # 找到了一个完整的JSON对象
+                    obj_text = content[start_pos:i+1]
+                    objects_found.append(obj_text)
+                    in_object = False
                     
-                    # 处理字符串中的字符
-                    if in_string:
-                        json_buffer += char
-                        if escape_next:
-                            escape_next = False
-                        elif char == '\\':
-                            escape_next = True
-                        elif char == '"':
-                            in_string = False
-                        continue
-                    
-                    # 处理非字符串内容
-                    json_buffer += char
-                    
-                    if char == '"':
-                        in_string = True
-                    elif char == '{':
-                        if bracket_depth == 0:
-                            in_object = True
-                        bracket_depth += 1
-                    elif char == '}':
-                        bracket_depth -= 1
-                        if bracket_depth == 0 and in_object:
-                            # 完成了一个JSON对象
-                            try:
-                                # 尝试解析对象
-                                relation_obj = json.loads(json_buffer)
-                                object_count += 1
-                                
-                                # 处理符合条件的关系
-                                if (isinstance(relation_obj, dict) and 
-                                    'id' in relation_obj and 'list' in relation_obj):
-                                    
-                                    rel_id_parts = relation_obj['id'].split('.')
-                                    if len(rel_id_parts) >= 3:
-                                        source_id = rel_id_parts[0]
-                                        target_id = rel_id_parts[1]
-                                        rel_type = rel_id_parts[2]
-                                        
-                                        # 检查是否与焦点实体相关
-                                        if source_id in focal_ids_set or target_id in focal_ids_set:
-                                            # 添加到对象缓冲区
-                                            objects_buffer.append(relation_obj)
-                                
-                            except json.JSONDecodeError:
-                                pass  # 忽略解析错误
-                            except Exception:
-                                pass  # 忽略所有错误以提高速度
-                            
-                            # 重置状态
-                            json_buffer = ""
-                            in_object = False
-                            
-                            # 报告进度
-                            current_time = datetime.now()
-                            time_diff = (current_time - last_report_time).total_seconds()
-                            
-                            # 每5秒或每1,000,000个对象报告一次进度
-                            if time_diff >= 5 or (object_count - last_report_objects) >= 1000000:
-                                elapsed_time = (current_time - start_time).total_seconds()
-                                percent_complete = total_processed_bytes / file_size * 100
-                                objects_per_second = (object_count - last_report_objects) / max(1, time_diff)
-                                
-                                print(f"进度: {percent_complete:.1f}% | 已处理: {object_count:,} 个对象 | "
-                                      f"找到匹配: {len(objects_buffer):,} | "
-                                      f"速率: {objects_per_second:.1f} 对象/秒 | "
-                                      f"已用时间: {elapsed_time:.0f}秒")
-                                
-                                last_report_time = current_time
-                                last_report_objects = object_count
-                            
-                            # 当积累了100,000个匹配对象时处理它们
-                            if len(objects_buffer) >= BATCH_SIZE:
-                                print(f"\n处理 {len(objects_buffer):,} 个匹配对象...")
-                                batch_start = datetime.now()
-                                
-                                for obj in objects_buffer:
-                                    try:
-                                        source_id = obj['id'].split('.')[0]
-                                        target_id = obj['id'].split('.')[1]
-                                        rel_type = obj['id'].split('.')[2]
-                                        rel_type_name = relation_schema.get(rel_type)
-                                        
-                                        # 从list中提取关系数据
-                                        for rel_data in obj.get('list', []):
-                                            if isinstance(rel_data, list) and len(rel_data) >= 3:
-                                                # 创建关系记录
-                                                relation = {
-                                                    "Original Relation ID": obj['id'],
-                                                    "Type": rel_type_name if rel_type_name else f"Unknown_{rel_type}",
-                                                    "Original Type ID": rel_type,
-                                                    "Original Source ID": source_id,
-                                                    "Original Target ID": target_id,
-                                                    "Source": "PubMed",
-                                                    "Score": rel_data[0],
-                                                    "Document ID": rel_data[1],
-                                                    "Probability": rel_data[2]
-                                                }
-                                                
-                                                extracted_relations.append(relation)
-                                                relation_count += 1
-                                                
-                                                # 更新实体连接
-                                                for drug_id in focal_entities.get('drug', []):
-                                                    if source_id == drug_id and target_id != drug_id:
-                                                        entity_connections['drug'][drug_id].add(target_id)
-                                                    elif target_id == drug_id and source_id != drug_id:
-                                                        entity_connections['drug'][drug_id].add(source_id)
-                                                
-                                                for disease_id in focal_entities.get('disease', []):
-                                                    if source_id == disease_id and target_id != disease_id:
-                                                        entity_connections['disease'][disease_id].add(target_id)
-                                                    elif target_id == disease_id and source_id != disease_id:
-                                                        entity_connections['disease'][disease_id].add(source_id)
-                                    except Exception:
-                                        pass  # 忽略错误，继续处理
-                                
-                                batch_time = (datetime.now() - batch_start).total_seconds()
-                                print(f"批处理完成，找到 {relation_count:,} 个关系，用时: {batch_time:.1f}秒")
-                                
-                                objects_buffer = []  # 清空缓冲区
-                                gc.collect()  # 强制垃圾回收
-            
-            # 处理剩余的对象
-            if objects_buffer:
-                print(f"\n处理剩余的 {len(objects_buffer):,} 个匹配对象...")
-                batch_start = datetime.now()
-                
-                for obj in objects_buffer:
-                    try:
-                        source_id = obj['id'].split('.')[0]
-                        target_id = obj['id'].split('.')[1]
-                        rel_type = obj['id'].split('.')[2]
-                        rel_type_name = relation_schema.get(rel_type)
+                    # 每找到100个对象，打印一次进度
+                    if len(objects_found) % 100 == 0:
+                        print(f"已识别 {len(objects_found)} 个JSON对象")
                         
-                        # 从list中提取关系数据
-                        for rel_data in obj.get('list', []):
-                            if isinstance(rel_data, list) and len(rel_data) >= 3:
-                                # 创建关系记录
-                                relation = {
-                                    "Original Relation ID": obj['id'],
-                                    "Type": rel_type_name if rel_type_name else f"Unknown_{rel_type}",
-                                    "Original Type ID": rel_type,
-                                    "Original Source ID": source_id,
-                                    "Original Target ID": target_id,
-                                    "Source": "PubMed",
-                                    "Score": rel_data[0],
-                                    "Document ID": rel_data[1],
-                                    "Probability": rel_data[2]
-                                }
-                                
-                                extracted_relations.append(relation)
-                                relation_count += 1
-                                
-                                # 更新实体连接
-                                for drug_id in focal_entities.get('drug', []):
-                                    if source_id == drug_id and target_id != drug_id:
-                                        entity_connections['drug'][drug_id].add(target_id)
-                                    elif target_id == drug_id and source_id != drug_id:
-                                        entity_connections['drug'][drug_id].add(source_id)
-                                
-                                for disease_id in focal_entities.get('disease', []):
-                                    if source_id == disease_id and target_id != disease_id:
-                                        entity_connections['disease'][disease_id].add(target_id)
-                                    elif target_id == disease_id and source_id != disease_id:
-                                        entity_connections['disease'][disease_id].add(source_id)
-                    except Exception:
-                        pass  # 忽略错误，继续处理
-                
-                batch_time = (datetime.now() - batch_start).total_seconds()
-                print(f"批处理完成，找到 {relation_count:,} 个关系，用时: {batch_time:.1f}秒")
-            
-            # 计算和报告总处理时间
-            total_time = (datetime.now() - start_time).total_seconds()
-            print(f"\nPubMed处理完成，处理了 {object_count:,} 个对象，找到 {relation_count:,} 个关系")
-            print(f"总处理时间: {total_time:.1f}秒 | "
-                  f"平均速率: {object_count/total_time:.1f} 对象/秒")
+                    # 为了避免内存问题，当积累了1000个对象时处理它们
+                    if len(objects_found) >= 1000:
+                        process_found_objects(objects_found, focal_ids, focal_entities, relation_schema, extracted_relations, entity_connections)
+                        objects_found = []  # 清空对象列表
+                        gc.collect()  # 强制垃圾回收
+        
+        # 处理剩余的对象
+        if objects_found:
+            process_found_objects(objects_found, focal_ids, focal_entities, relation_schema, extracted_relations, entity_connections)
+        
+        print(f"PubMed处理完成，找到 {len(extracted_relations)} 个关系")
     
     except Exception as e:
         print(f"处理PubMed文件时出错: {e}")
@@ -747,9 +435,9 @@ def efficient_pubmed_processing(file_path, focal_ids, focal_entities, relation_s
 
 def simple_pubmed_processing(file_path, focal_ids, focal_entities, relation_schema):
     """
-    简单的PubMed关系处理方法，使用行读取和大批处理
+    简单的PubMed关系处理方法，作为最后的备用选项
     """
-    print(f"尝试使用简单行处理方法处理PubMed关系（每批 {BATCH_SIZE:,} 个对象）...")
+    print("尝试使用最简单的PubMed处理方法...")
     
     extracted_relations = []
     entity_connections = {
@@ -757,14 +445,7 @@ def simple_pubmed_processing(file_path, focal_ids, focal_entities, relation_sche
         'disease': {disease_id: set() for disease_id in focal_entities.get('disease', [])}
     }
     
-    # 创建焦点ID集合用于快速查找
-    focal_ids_set = set(focal_ids)
-    
     try:
-        # 获取文件大小以计算进度
-        file_size = os.path.getsize(file_path)
-        start_time = datetime.now()
-        
         # 尝试按照小段读取文件
         with open(file_path, 'r', encoding='utf-8') as f:
             # 跳过文件开头的'['
@@ -776,11 +457,6 @@ def simple_pubmed_processing(file_path, focal_ids, focal_entities, relation_sche
             in_object = False
             object_count = 0
             relation_count = 0
-            last_report_time = start_time
-            last_report_objects = 0
-            
-            # 创建对象缓冲区
-            objects_buffer = []
             
             for line in f:
                 line = line.strip()
@@ -817,149 +493,67 @@ def simple_pubmed_processing(file_path, focal_ids, focal_entities, relation_sche
                                 if len(parts) >= 3:
                                     source_id = parts[0]
                                     target_id = parts[1]
+                                    relation_type = parts[2]
                                     
                                     # 检查是否与焦点实体相关
-                                    if source_id in focal_ids_set or target_id in focal_ids_set:
-                                        # 将对象添加到缓冲区
-                                        objects_buffer.append(obj)
-                            
-                            # 报告进度
-                            current_time = datetime.now()
-                            time_diff = (current_time - last_report_time).total_seconds()
-                            
-                            if time_diff >= 5 or (object_count - last_report_objects) >= 1000000:
-                                elapsed_time = (current_time - start_time).total_seconds()
-                                tell_position = f.tell()
-                                percent_complete = tell_position / file_size * 100
-                                objects_per_second = (object_count - last_report_objects) / max(1, time_diff)
-                                
-                                print(f"进度: {percent_complete:.1f}% | 已处理: {object_count:,} 个对象 | "
-                                      f"找到匹配: {len(objects_buffer):,} | "
-                                      f"速率: {objects_per_second:.1f} 对象/秒 | "
-                                      f"已用时间: {elapsed_time:.0f}秒")
-                                
-                                last_report_time = current_time
-                                last_report_objects = object_count
-                            
-                            # 当积累了100,000个匹配对象时处理它们
-                            if len(objects_buffer) >= BATCH_SIZE:
-                                print(f"\n处理 {len(objects_buffer):,} 个匹配对象...")
-                                batch_start = datetime.now()
-                                
-                                batch_relations = 0
-                                for obj in objects_buffer:
-                                    try:
-                                        source_id = obj['id'].split('.')[0]
-                                        target_id = obj['id'].split('.')[1]
-                                        rel_type = obj['id'].split('.')[2]
-                                        rel_type_name = relation_schema.get(rel_type)
+                                    if source_id in focal_ids or target_id in focal_ids:
+                                        # 获取关系类型名称
+                                        relation_type_name = relation_schema.get(relation_type)
                                         
                                         # 从list中提取关系数据
                                         for rel_data in obj.get('list', []):
                                             if isinstance(rel_data, list) and len(rel_data) >= 3:
+                                                score = rel_data[0]
+                                                document_id = rel_data[1]
+                                                probability = rel_data[2]
+                                                
                                                 # 创建关系记录
                                                 relation = {
                                                     "Original Relation ID": obj['id'],
-                                                    "Type": rel_type_name if rel_type_name else f"Unknown_{rel_type}",
-                                                    "Original Type ID": rel_type,
+                                                    "Type": relation_type_name if relation_type_name else f"Unknown_{relation_type}",
+                                                    "Original Type ID": relation_type,
                                                     "Original Source ID": source_id,
                                                     "Original Target ID": target_id,
                                                     "Source": "PubMed",
-                                                    "Score": rel_data[0],
-                                                    "Document ID": rel_data[1],
-                                                    "Probability": rel_data[2]
+                                                    "Score": score,
+                                                    "Document ID": document_id,
+                                                    "Probability": probability
                                                 }
                                                 
+                                                # 添加到提取的关系
                                                 extracted_relations.append(relation)
                                                 relation_count += 1
-                                                batch_relations += 1
                                                 
-                                                # 更新实体连接
+                                                # 更新连接
+                                                # 对于药物
                                                 for drug_id in focal_entities.get('drug', []):
                                                     if source_id == drug_id and target_id != drug_id:
                                                         entity_connections['drug'][drug_id].add(target_id)
                                                     elif target_id == drug_id and source_id != drug_id:
                                                         entity_connections['drug'][drug_id].add(source_id)
                                                 
+                                                # 对于疾病
                                                 for disease_id in focal_entities.get('disease', []):
                                                     if source_id == disease_id and target_id != disease_id:
                                                         entity_connections['disease'][disease_id].add(target_id)
                                                     elif target_id == disease_id and source_id != disease_id:
                                                         entity_connections['disease'][disease_id].add(source_id)
-                                    except Exception:
-                                        pass  # 忽略错误，继续处理
+                            
+                            # 定期报告进度
+                            if object_count % 1000 == 0:
+                                print(f"已处理 {object_count} 个对象，找到 {relation_count} 个关系")
+                                gc.collect()
                                 
-                                batch_time = (datetime.now() - batch_start).total_seconds()
-                                print(f"批处理完成，找到 {batch_relations:,} 个关系，总计: {relation_count:,}，用时: {batch_time:.1f}秒")
-                                
-                                objects_buffer = []  # 清空缓冲区
-                                gc.collect()  # 强制垃圾回收
-                                
-                        except json.JSONDecodeError:
+                        except json.JSONDecodeError as e:
                             # 忽略解析错误，继续处理下一个对象
-                            pass
+                            print(f"无法解析对象: {e}")
                         
                         # 重置状态
                         buffer = ""
                         in_object = False
                         depth = 0
-            
-            # 处理剩余的对象
-            if objects_buffer:
-                print(f"\n处理剩余的 {len(objects_buffer):,} 个匹配对象...")
-                batch_start = datetime.now()
-                
-                batch_relations = 0
-                for obj in objects_buffer:
-                    try:
-                        source_id = obj['id'].split('.')[0]
-                        target_id = obj['id'].split('.')[1]
-                        rel_type = obj['id'].split('.')[2]
-                        rel_type_name = relation_schema.get(rel_type)
-                        
-                        # 从list中提取关系数据
-                        for rel_data in obj.get('list', []):
-                            if isinstance(rel_data, list) and len(rel_data) >= 3:
-                                # 创建关系记录
-                                relation = {
-                                    "Original Relation ID": obj['id'],
-                                    "Type": rel_type_name if rel_type_name else f"Unknown_{rel_type}",
-                                    "Original Type ID": rel_type,
-                                    "Original Source ID": source_id,
-                                    "Original Target ID": target_id,
-                                    "Source": "PubMed",
-                                    "Score": rel_data[0],
-                                    "Document ID": rel_data[1],
-                                    "Probability": rel_data[2]
-                                }
-                                
-                                extracted_relations.append(relation)
-                                relation_count += 1
-                                batch_relations += 1
-                                
-                                # 更新实体连接
-                                for drug_id in focal_entities.get('drug', []):
-                                    if source_id == drug_id and target_id != drug_id:
-                                        entity_connections['drug'][drug_id].add(target_id)
-                                    elif target_id == drug_id and source_id != drug_id:
-                                        entity_connections['drug'][drug_id].add(source_id)
-                                
-                                for disease_id in focal_entities.get('disease', []):
-                                    if source_id == disease_id and target_id != disease_id:
-                                        entity_connections['disease'][disease_id].add(target_id)
-                                    elif target_id == disease_id and source_id != disease_id:
-                                        entity_connections['disease'][disease_id].add(source_id)
-                    except Exception:
-                        pass  # 忽略错误，继续处理
-                
-                batch_time = (datetime.now() - batch_start).total_seconds()
-                print(f"批处理完成，找到 {batch_relations:,} 个关系，总计: {relation_count:,}，用时: {batch_time:.1f}秒")
         
-        # 计算和报告总处理时间
-        total_time = (datetime.now() - start_time).total_seconds()
-        print(f"\n简单处理完成，处理了 {object_count:,} 个对象，找到 {relation_count:,} 个关系")
-        print(f"总处理时间: {total_time:.1f}秒 | "
-              f"平均速率: {object_count/total_time:.1f} 对象/秒")
+        print(f"简单处理完成，找到 {len(extracted_relations)} 个关系")
     
     except Exception as e:
         print(f"简单处理时出错: {e}")
@@ -967,9 +561,263 @@ def simple_pubmed_processing(file_path, focal_ids, focal_entities, relation_sche
     
     return extracted_relations, entity_connections
 
+# 修复：将这个函数设计为在每个进程中单独读取文件
+def process_pubmed_chunk_range(ranges, file_path, focal_ids, focal_entities, relation_schema, chunk_id):
+    """处理PubMed文件的特定范围 - 每个进程独立打开文件并仅读取所需部分"""
+    chunk_relations = []
+    chunk_connections = {
+        'drug': {drug_id: set() for drug_id in focal_entities.get('drug', [])},
+        'disease': {disease_id: set() for disease_id in focal_entities.get('disease', [])}
+    }
+    
+    # 进度跟踪
+    total_positions = len(ranges)
+    processed = 0
+    last_report = 0
+    
+    # 打开文件 - 每个进程独立打开
+    with open(file_path, 'r', encoding='utf-8') as file:
+        for start_pos, end_pos in ranges:
+            try:
+                # 移动到指定位置并只读取所需的部分
+                file.seek(start_pos)
+                obj_text = file.read(end_pos - start_pos)
+                
+                # 解析JSON对象
+                relation_obj = json.loads(obj_text)
+                
+                # 处理单个对象
+                if not isinstance(relation_obj, dict) or 'id' not in relation_obj or 'list' not in relation_obj:
+                    continue
+                
+                # 解析关系ID
+                rel_id_parts = relation_obj['id'].split('.')
+                if len(rel_id_parts) < 3:
+                    continue
+                
+                source_id = rel_id_parts[0]
+                target_id = rel_id_parts[1]
+                relation_type = rel_id_parts[2]
+                
+                # 检查是否与焦点实体相关
+                if source_id in focal_ids or target_id in focal_ids:
+                    # 获取关系类型名称
+                    relation_type_name = relation_schema.get(relation_type)
+                    
+                    # 从list中提取关系数据
+                    for rel_data in relation_obj.get('list', []):
+                        if isinstance(rel_data, list) and len(rel_data) >= 3:
+                            # 创建关系记录
+                            relation = {
+                                "Original Relation ID": relation_obj['id'],
+                                "Type": relation_type_name if relation_type_name else f"Unknown_{relation_type}",
+                                "Original Type ID": relation_type,
+                                "Original Source ID": source_id,
+                                "Original Target ID": target_id,
+                                "Source": "PubMed",
+                                "Score": rel_data[0],
+                                "Document ID": rel_data[1],
+                                "Probability": rel_data[2]
+                            }
+                            
+                            # 添加到提取的关系
+                            chunk_relations.append(relation)
+                            
+                            # 更新连接
+                            for drug_id in focal_entities.get('drug', []):
+                                if source_id == drug_id and target_id != drug_id:
+                                    chunk_connections['drug'][drug_id].add(target_id)
+                                elif target_id == drug_id and source_id != drug_id:
+                                    chunk_connections['drug'][drug_id].add(source_id)
+                            
+                            for disease_id in focal_entities.get('disease', []):
+                                if source_id == disease_id and target_id != disease_id:
+                                    chunk_connections['disease'][disease_id].add(target_id)
+                                elif target_id == disease_id and source_id != disease_id:
+                                    chunk_connections['disease'][disease_id].add(source_id)
+            
+            except json.JSONDecodeError:
+                continue  # 跳过解析错误
+            except Exception as e:
+                pass  # 跳过所有错误，继续处理
+            
+            # 更新进度计数
+            processed += 1
+            
+            # 每处理5%的数据报告一次进度
+            report_threshold = total_positions // 20
+            if report_threshold > 0 and (processed - last_report) >= report_threshold:
+                print(f"块 {chunk_id}: 已处理 {processed}/{total_positions} 个对象 ({processed/total_positions*100:.1f}%)")
+                last_report = processed
+    
+    # 完成进度报告
+    print(f"块 {chunk_id} 完成: 找到 {len(chunk_relations)} 个关系")
+    return chunk_relations, chunk_connections
+
+def fast_process_pubmed_relations_fixed(file_path, focal_ids, focal_entities, relation_schema):
+    """
+    修复的高性能处理PubMed关系数据函数 - 不再尝试在进程间共享大型文件内容
+    """
+    print("使用修复的高性能并行处理方法处理PubMed关系...")
+    
+    # 全局配置 - 减少工作进程数量以避免资源争用
+    MAX_WORKERS = min(6, max(2, mp.cpu_count() // 2))  # 使用更少的工作进程
+    print(f"使用 {MAX_WORKERS} 个工作进程")
+    
+    # 获取文件大小
+    file_size = os.path.getsize(file_path)
+    print(f"PubMed文件大小: {file_size/1024/1024:.2f} MB")
+    
+    # 使用多步骤优化：
+    # 1. 首先检查是否缓存了对象索引
+    index_file = file_path + '.index'
+    if os.path.exists(index_file):
+        print(f"使用缓存的对象索引: {index_file}")
+        try:
+            with open(index_file, 'r') as f:
+                object_positions = json.load(f)
+        except:
+            # 如果加载缓存文件失败，重新创建索引
+            print("缓存索引损坏，重新创建...")
+            object_positions = None
+    else:
+        object_positions = None
+    
+    # 2. 如果没有缓存，创建新的索引
+    if object_positions is None:
+        print("创建对象索引...")
+        object_positions = []
+        
+        with open(file_path, 'r', encoding='utf-8') as f:
+            # 跳过开头的 '['
+            char = f.read(1)
+            if char != '[':
+                f.seek(0)  # 如果不是以'['开头，重置位置
+            
+            # 快速扫描文件寻找对象边界
+            content = f.read()
+            
+            bracket_depth = 0
+            in_string = False
+            escape_next = False
+            start_pos = 0
+            
+            # 快速字符级扫描，仅记录对象位置而不处理内容
+            for i, char in enumerate(content):
+                if in_string:
+                    if escape_next:
+                        escape_next = False
+                    elif char == '\\':
+                        escape_next = True
+                    elif char == '"':
+                        in_string = False
+                    continue
+                
+                if char == '"':
+                    in_string = True
+                elif char == '{':
+                    if bracket_depth == 0:
+                        start_pos = i
+                    bracket_depth += 1
+                elif char == '}':
+                    bracket_depth -= 1
+                    if bracket_depth == 0:
+                        # 找到完整对象，记录位置
+                        object_positions.append((start_pos, i + 1))
+                        
+                        # 显示进度
+                        if len(object_positions) % 100000 == 0:  # 减少进度报告频率
+                            print(f"已识别 {len(object_positions)} 个对象位置")
+        
+        # 保存索引以便未来使用
+        try:
+            with open(index_file, 'w') as f:
+                json.dump(object_positions, f)
+            print(f"索引已保存到: {index_file}")
+        except Exception as e:
+            print(f"保存索引时出错: {e}")
+        
+        print(f"索引创建完成，共找到 {len(object_positions)} 个对象")
+    
+    # 重要修复：分配任务给进程 - 每个进程只处理位置列表而不是文件内容
+    total_objects = len(object_positions)
+    chunk_size = total_objects // MAX_WORKERS + 1  # 确保每个进程都有工作
+    
+    # 创建每个进程处理的范围
+    ranges = []
+    for i in range(0, total_objects, chunk_size):
+        chunk_range = object_positions[i:i+chunk_size]
+        ranges.append(chunk_range)
+    
+    print(f"将 {total_objects} 个对象分成 {len(ranges)} 个批次，每批次约 {chunk_size} 个对象")
+    
+    # 初始化结果容器
+    all_relations = []
+    entity_connections = {
+        'drug': {drug_id: set() for drug_id in focal_entities.get('drug', [])},
+        'disease': {disease_id: set() for disease_id in focal_entities.get('disease', [])}
+    }
+    
+    # 使用单一线程处理小文件或测试
+    if total_objects < 1000 or MAX_WORKERS == 1:
+        print("使用单线程处理少量对象...")
+        for i, chunk_range in enumerate(ranges):
+            relations, connections = process_pubmed_chunk_range(
+                chunk_range, file_path, focal_ids, focal_entities, relation_schema, i
+            )
+            all_relations.extend(relations)
+            
+            # 合并连接
+            for drug_id in connections['drug']:
+                if drug_id in entity_connections['drug']:
+                    entity_connections['drug'][drug_id].update(connections['drug'][drug_id])
+            
+            for disease_id in connections['disease']:
+                if disease_id in entity_connections['disease']:
+                    entity_connections['disease'][disease_id].update(connections['disease'][disease_id])
+    else:
+        # 并行处理大型文件
+        try:
+            # 为每个进程准备参数 - 不再传递文件内容
+            tasks = []
+            for i, chunk_range in enumerate(ranges):
+                tasks.append((chunk_range, file_path, focal_ids, focal_entities, relation_schema, i))
+            
+            # 使用进程池并行处理
+            with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                # 异步提交所有任务
+                futures = [executor.submit(process_pubmed_chunk_range, *task) for task in tasks]
+                
+                # 收集结果，同时显示进度
+                completed = 0
+                for future in futures:
+                    try:
+                        relations, connections = future.result()
+                        all_relations.extend(relations)
+                        
+                        # 合并连接
+                        for drug_id in connections['drug']:
+                            if drug_id in entity_connections['drug']:
+                                entity_connections['drug'][drug_id].update(connections['drug'][drug_id])
+                        
+                        for disease_id in connections['disease']:
+                            if disease_id in entity_connections['disease']:
+                                entity_connections['disease'][disease_id].update(connections['disease'][disease_id])
+                        
+                        completed += 1
+                        print(f"进度: {completed}/{len(ranges)} 批次完成")
+                    except Exception as e:
+                        print(f"处理批次时出错: {e}")
+        
+        except Exception as e:
+            print(f"并行处理出错: {e}")
+            print(tb.format_exc())
+    
+    print(f"PubMed处理完成，找到 {len(all_relations)} 个关系")
+    return all_relations, entity_connections
+
 def parse_arguments():
     """解析命令行参数"""
-    global BATCH_SIZE
     print("原始命令行参数:", sys.argv)
     
     parser = argparse.ArgumentParser(description='iKGraph Knowledge Graph Data Extraction Tool')
@@ -992,14 +840,8 @@ def parse_arguments():
     parser.add_argument('--parallel_chunks', type=int, default=DATA_LOADING['parallel_chunks'], help='并行处理的块数')
     parser.add_argument('--process_count', type=int, default=max(4, mp.cpu_count() // 2), help='并行处理的进程数')
     parser.add_argument('--low_memory', action='store_true', help='启用低内存模式')
-    parser.add_argument('--batch_size', type=int, default=BATCH_SIZE, help='PubMed处理的批量大小')
     
     args = parser.parse_args()
-    
-    # 设置全局批处理大小
-
-    if args.batch_size > 0:
-        BATCH_SIZE = args.batch_size
     
     # 添加调试输出
     print("解析后的参数:")
@@ -1010,7 +852,6 @@ def parse_arguments():
     print("精确匹配:", args.exact_match)
     print("使用进程数:", args.process_count)
     print("块大小:", args.chunk_size)
-    print("批处理大小:", BATCH_SIZE)
     print("检查数据目录:")
     print("目录存在:", os.path.exists(args.data_dir))
     if os.path.exists(args.data_dir):
@@ -1184,7 +1025,7 @@ def run_extraction(args):
         del db_data
         gc.collect()
         
-        # 提取PubMed关系 - 使用高性能方法
+        # 提取PubMed关系 - 使用修复的高性能方法
         logger.info("提取PubMed关系...")
         pubmed_file = os.path.join(args.data_dir, "PubMedList.json")
         print(f"尝试加载PubMed文件: {pubmed_file}")
@@ -1200,32 +1041,17 @@ def run_extraction(args):
                 'disease': [entity["Original ID"] for entity in disease_entities] if 'disease_entities' in locals() else []
             }
             
-            # 尝试不同的处理方法，按照推荐的顺序
-            # 1. 首先尝试高效流式处理
-            pubmed_relations = []
-            entity_connections = {}
-            
-            print("尝试方法1: 高效流式处理")
-            pubmed_relations, entity_connections = efficient_pubmed_processing(
+            # 使用修复后的高性能处理方法
+            pubmed_relations, entity_connections = fast_process_pubmed_relations_fixed(
                 pubmed_file,
                 focal_ids,
                 simple_focal_entities,
                 relation_schema
             )
             
-            # 2. 如果没有找到关系，尝试简单行处理方法
+            # 如果没有找到关系，尝试原始方法作为备份
             if not pubmed_relations:
-                print("\n方法1未找到关系，尝试方法2: 简单行处理")
-                pubmed_relations, entity_connections = simple_pubmed_processing(
-                    pubmed_file,
-                    focal_ids,
-                    simple_focal_entities,
-                    relation_schema
-                )
-            
-            # 3. 如果仍然没有找到关系，尝试原始处理方法
-            if not pubmed_relations:
-                print("\n方法2未找到关系，尝试方法3: 原始字符级处理")
+                print("使用修复的高性能方法未找到关系，尝试原始处理方法...")
                 pubmed_relations, entity_connections = process_pubmed_relations(
                     pubmed_file,
                     focal_ids,

@@ -46,11 +46,11 @@ def parse_arguments():
     # 性能参数
     parser.add_argument('--chunk_size', type=int, default=1000000, help='大文件处理的块大小')
     parser.add_argument('--low_memory', action='store_true', help='启用低内存模式')
-    
-
     parser.add_argument('--buffer_size', type=int, default=50*1024*1024, help='文件读取缓冲区大小')
     parser.add_argument('--process_count', type=int, default=4, help='并行处理的进程数')
     parser.add_argument('--parallel_chunks', type=int, default=24, help='并行处理的块数')
+    # 新增批处理大小参数
+    parser.add_argument('--batch_size', type=int, default=100000, help='PubMed处理的批量大小 (积累多少对象处理一次)')
     
     return parser.parse_args()
 
@@ -83,6 +83,18 @@ def run_extract(args):
         extract_args.append('--exact_match')
     if args.low_memory:
         extract_args.append('--low_memory')
+    
+    # 添加性能参数
+    if args.process_count:
+        extract_args.extend(['--process_count', str(args.process_count)])
+    if args.buffer_size:
+        extract_args.extend(['--buffer_size', str(args.buffer_size)])
+    if args.parallel_chunks:
+        extract_args.extend(['--parallel_chunks', str(args.parallel_chunks)])
+    
+    # 添加批处理大小参数
+    if args.batch_size:
+        extract_args.extend(['--batch_size', str(args.batch_size)])
     
     # 执行命令
     cmd = ' '.join(extract_args)
@@ -188,8 +200,4 @@ def main():
     return 0
 
 if __name__ == "__main__":
-    sys.exit(main()) 
-
-
-
-
+    sys.exit(main())
