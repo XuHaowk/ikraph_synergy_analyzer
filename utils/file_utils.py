@@ -104,6 +104,19 @@ def save_to_csv(data, file_path, append=False):
         logger.error(f"不支持的数据类型: {type(data)}")
         return file_path
     
+    # 清理列名中的非ASCII字符
+    df.columns = [col.encode('ascii', 'ignore').decode('ascii') if isinstance(col, str) else str(col) for col in df.columns]
+    
+    # 清理数据中的非ASCII字符（除了特定的希腊字母等）
+    for col in df.columns:
+        if df[col].dtype == 'object':  # 只处理字符串列
+            try:
+                # 尝试清理字符串值
+                df[col] = df[col].apply(lambda x: x.encode('ascii', 'ignore').decode('ascii') if isinstance(x, str) else x)
+            except Exception:
+                # 忽略无法清理的列
+                pass
+    
     # 保存为CSV
     mode = 'a' if append else 'w'
     header = not append if os.path.exists(file_path) else True
@@ -201,3 +214,4 @@ def save_relations_to_csv(relations, output_dir, file_name="relations.csv", appe
     
     relations_file = os.path.join(output_dir, "tables", file_name)
     return save_to_csv(relations, relations_file, append) 
+

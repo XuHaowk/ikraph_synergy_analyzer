@@ -121,12 +121,17 @@ def run_synergy(args):
         '--output_dir', args.output_dir,
         '--drug1', args.drug1,
         '--drug2', args.drug2,
-        '--disease', args.disease
+        '--disease', args.disease,
+        '--entities_file', os.path.join(args.output_dir, 'tables', 'all_entities.csv'),
+        '--relations_file', os.path.join(args.output_dir, 'tables', 'relations.csv')
     ]
     
     # 添加其他参数
     if args.exact_match:
         synergy_args.append('--exact_match')
+    
+    # 强制生成可视化
+    synergy_args.append('--generate_viz')
     
     # 执行命令
     cmd = ' '.join(synergy_args)
@@ -147,12 +152,17 @@ def run_toxicity(args):
         'python', 'scripts/analyze_toxicity.py',
         '--output_dir', args.output_dir,
         '--toxic_drug', args.drug1,
-        '--protective_drug', args.drug2
+        '--protective_drug', args.drug2,
+        '--entities_file', os.path.join(args.output_dir, 'tables', 'all_entities.csv'),
+        '--relations_file', os.path.join(args.output_dir, 'tables', 'relations.csv')
     ]
     
     # 添加其他参数
     if args.exact_match:
         toxicity_args.append('--exact_match')
+    
+    # 强制生成可视化
+    toxicity_args.append('--generate_viz')
     
     # 执行命令
     cmd = ' '.join(toxicity_args)

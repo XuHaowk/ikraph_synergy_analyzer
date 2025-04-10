@@ -160,8 +160,14 @@ def run_analysis(args):
         
         # 生成机制图
         mechanism_file = os.path.join(graphs_dir, f"{base_filename}_mechanism.png")
-        generate_mechanism_diagram(toxicity_result['mechanisms'], mechanism_file,
-                                  title=f"毒性减轻机制: {protective_drug_entity['Name']} 保护 {toxic_drug_entity['Name']} 毒性")
+        
+        # 使用实体名称创建标题
+        toxic_drug_name = toxic_drug_entity['Name']
+        protective_drug_name = protective_drug_entity['Name']
+        
+        mechanism_title = f"毒性减轻机制: {protective_drug_name} 保护 {toxic_drug_name} 毒性"
+        
+        generate_mechanism_diagram(toxicity_result['mechanisms'], mechanism_file, title=mechanism_title)
         
         # 收集毒性节点和基因节点
         nodes_to_keep = set([toxic_drug_id, protective_drug_id])
@@ -175,8 +181,10 @@ def run_analysis(args):
         
         # 生成网络可视化
         viz_file = os.path.join(graphs_dir, f"{base_filename}_network.html")
-        generate_network_visualization(subgraph, viz_file,
-                                     title=f"毒性减轻网络: {protective_drug_entity['Name']} 保护 {toxic_drug_entity['Name']} 毒性")
+        
+        network_title = f"毒性减轻网络: {protective_drug_name} 保护 {toxic_drug_name} 毒性"
+        
+        generate_network_visualization(subgraph, viz_file, title=network_title)
     
     logger.info("药物毒性减轻分析流程完成")
     return True

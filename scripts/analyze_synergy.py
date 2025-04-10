@@ -14,7 +14,7 @@ import pandas as pd
 import networkx as nx
 import json
 from datetime import datetime
-
+from core.graph_builder import create_drug_synergy_subgraph
 # 添加项目根目录到路径
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -159,9 +159,20 @@ def run_analysis(args):
         
         # 生成网络可视化
         viz_file = os.path.join(graphs_dir, f"{base_filename}_network.html")
-        subgraph = synergy_analyzer.create_synergy_subgraph(drug1_id, drug2_id, disease_id)
-        generate_network_visualization(subgraph, viz_file, 
-                                      title=f"药物协同网络: {drug1_entity['Name']} + {drug2_entity['Name']} -> {disease_entity['Name']}")
+        
+        # 获取完整的实体名称
+        drug1_name = drug1_entity['Name']
+        drug2_name = drug2_entity['Name']
+        disease_name = disease_entity['Name']
+        
+        # 创建更有意义的标题
+        viz_title = f"药物协同网络: {drug1_name} + {drug2_name} → {disease_name}"
+        
+        # 添加药物靶点和相关节点
+        subgraph = create_drug_synergy_subgraph(G, drug1_id, drug2_id, disease_id, max_intermediate_nodes=50)
+        
+        # 调用可视化函数
+        generate_network_visualization(subgraph, viz_file, title=viz_title)
         
         # 生成机制图
         if synergy_result['common_targets'] or synergy_result['complementary_mechanisms']:
@@ -174,11 +185,11 @@ def run_analysis(args):
             for target in synergy_result['common_targets']:
                 mechanisms.append({
                     'drug_id': drug1_id,
-                    'drug_name': drug1_entity['Name'],
+                    'drug_name': drug1_name,
                     'gene_id': target['target_id'],
                     'gene_name': target['target_name'],
                     'target_id': disease_id,
-                    'target_name': disease_entity['Name'],
+                    'target_name': disease_name,
                     'drug_gene_direction': target['drug1_regulation'],
                     'gene_target_direction': target['disease_direction'],
                     'mechanism_type': 'common_target'
@@ -186,11 +197,11 @@ def run_analysis(args):
                 
                 mechanisms.append({
                     'drug_id': drug2_id,
-                    'drug_name': drug2_entity['Name'],
+                    'drug_name': drug2_name,
                     'gene_id': target['target_id'],
                     'gene_name': target['target_name'],
                     'target_id': disease_id,
-                    'target_name': disease_entity['Name'],
+                    'target_name': disease_name,
                     'drug_gene_direction': target['drug2_regulation'],
                     'gene_target_direction': target['disease_direction'],
                     'mechanism_type': 'common_target'
@@ -200,11 +211,11 @@ def run_analysis(args):
             for mechanism in synergy_result['complementary_mechanisms']:
                 mechanisms.append({
                     'drug_id': drug1_id,
-                    'drug_name': drug1_entity['Name'],
+                    'drug_name': drug1_name,
                     'gene_id': mechanism['target1_id'],
                     'gene_name': mechanism['target1_name'],
                     'target_id': disease_id,
-                    'target_name': disease_entity['Name'],
+                    'target_name': disease_name,
                     'drug_gene_direction': mechanism['drug1_regulation'],
                     'gene_target_direction': 0,  # 未直接连接到疾病
                     'mechanism_type': 'complementary'
@@ -212,22 +223,126 @@ def run_analysis(args):
                 
                 mechanisms.append({
                     'drug_id': drug2_id,
-                    'drug_name': drug2_entity['Name'],
+                    'drug_name': drug2_name,
                     'gene_id': mechanism['target2_id'],
                     'gene_name': mechanism['target2_name'],
                     'target_id': disease_id,
-                    'target_name': disease_entity['Name'],
+                    'target_name': disease_name,
                     'drug_gene_direction': mechanism['drug2_regulation'],
                     'gene_target_direction': 0,  # 未直接连接到疾病
                     'mechanism_type': 'complementary'
                 })
             
             generate_mechanism_diagram(mechanisms, mechanism_file, 
-                                     title=f"协同作用机制: {drug1_entity['Name']} + {drug2_entity['Name']} -> {disease_entity['Name']}")
+                                     title=f"协同作用机制: {drug1_name} + {drug2_name} → {disease_name}")
     
     logger.info("药物协同分析流程完成")
     return True
-
+def create_drug_synergy_subgraph(G, drug1_id, drug2_id, disease_id, max_intermediate_nodes=50):
+    """
+    创建药物协同作用子图，重点包含两种药物的共同靶点和通向疾病的路径
+    
+    Parameters:
+    - G: 原始NetworkX图
+    - drug1_id: 第一种药物ID
+    - drug2_id: 第二种药物ID
+    - disease_id: 疾病ID
+    - max_intermediate_nodes: 最大中间节点数量
+    
+    Returns:
+    - 协同作用子图
+    """
+    logger.info(f"创建药物协同子图: 药物1={drug1_id}, 药物2={drug2_id}, 疾病={disease_id}")
+    
+    # 必须保留的节点
+    nodes_to_keep = {drug1_id, drug2_id, disease_id}
+    
+    # 获取药物1的邻居
+    drug1_neighbors = set(G.neighbors(drug1_id)) if drug1_id in G else set()
+    
+    # 获取药物2的邻居
+    drug2_neighbors = set(G.neighbors(drug2_id)) if drug2_id in G else set()
+    
+    # 获取共同邻居（共同靶点）
+    common_neighbors = drug1_neighbors.intersection(drug2_neighbors)
+    logger.info(f"发现 {len(common_neighbors)} 个共同靶点")
+    
+    # 添加共同靶点
+    nodes_to_keep.update(common_neighbors)
+    
+    # 查找从共同靶点到疾病的最短路径
+    paths_to_disease = []
+    for node in common_neighbors:
+        try:
+            if nx.has_path(G, node, disease_id):
+                path = nx.shortest_path(G, node, disease_id)
+                paths_to_disease.append(path)
+        except nx.NetworkXError:
+            continue
+    
+    # 添加路径中的所有节点
+    for path in paths_to_disease:
+        nodes_to_keep.update(path)
+    
+    # 如果共同靶点少于阈值，添加各自的一些靶点
+    if len(common_neighbors) < 5:
+        # 按关系强度排序药物1的靶点
+        drug1_targets = []
+        for target in drug1_neighbors:
+            if target in G[drug1_id]:
+                confidence = G[drug1_id][target].get('confidence', G[drug1_id][target].get('Confidence', 0))
+                drug1_targets.append((target, confidence))
+        
+        drug1_targets.sort(key=lambda x: x[1], reverse=True)
+        
+        # 按关系强度排序药物2的靶点
+        drug2_targets = []
+        for target in drug2_neighbors:
+            if target in G[drug2_id]:
+                confidence = G[drug2_id][target].get('confidence', G[drug2_id][target].get('Confidence', 0))
+                drug2_targets.append((target, confidence))
+        
+        drug2_targets.sort(key=lambda x: x[1], reverse=True)
+        
+        # 添加一些重要靶点
+        top_targets_to_add = min(10, max_intermediate_nodes // 2)
+        for target, _ in drug1_targets[:top_targets_to_add]:
+            nodes_to_keep.add(target)
+        
+        for target, _ in drug2_targets[:top_targets_to_add]:
+            nodes_to_keep.add(target)
+    
+    # 限制总节点数
+    if len(nodes_to_keep) > max_intermediate_nodes + 3:  # +3 for the drugs and disease
+        # 确保药物和疾病节点保留
+        essential_nodes = {drug1_id, drug2_id, disease_id}
+        other_nodes = list(nodes_to_keep - essential_nodes)
+        
+        # 随机选择其他节点
+        import random
+        selected_others = random.sample(other_nodes, max_intermediate_nodes)
+        nodes_to_keep = set(essential_nodes).union(selected_others)
+    
+    # 创建子图
+    subgraph = G.subgraph(nodes_to_keep)
+    
+    # 确保所有节点都有Name或name属性
+    for node_id in subgraph.nodes():
+        node_attrs = subgraph.nodes[node_id]
+        if 'Name' not in node_attrs and 'name' not in node_attrs:
+            # 如果没有名称，添加一个基于ID的名称
+            if node_id == drug1_id:
+                subgraph.nodes[node_id]['name'] = "Drug 1"
+            elif node_id == drug2_id:
+                subgraph.nodes[node_id]['name'] = "Drug 2"
+            elif node_id == disease_id:
+                subgraph.nodes[node_id]['name'] = "Disease"
+            else:
+                subgraph.nodes[node_id]['name'] = f"Node {node_id}"
+    
+    logger.info(f"创建的药物协同子图包含 {len(subgraph.nodes)} 个节点和 {len(subgraph.edges)} 条边")
+    
+    return subgraph
 def main():
     """主函数"""
     # 设置日志
@@ -261,3 +376,5 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main()) 
+
+

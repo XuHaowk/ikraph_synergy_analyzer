@@ -239,6 +239,13 @@ def extract_keyword_entities(nodes_data, keywords=None, entity_types=None, exact
             cleaned_official_name = clean_non_ascii_chars(original_official_name, preserve_greek=True)
             cleaned_common_name = clean_non_ascii_chars(original_common_name, preserve_greek=True)
             
+            # 获取新颖性信息
+            novelty = None
+            if "novelty" in node:
+                novelty = node["novelty"]
+            elif "Novelty" in node:
+                novelty = node["Novelty"]
+            
             # 创建实体记录
             entity = {
                 "Original ID": node.get("biokdeid", ""),
@@ -249,8 +256,17 @@ def extract_keyword_entities(nodes_data, keywords=None, entity_types=None, exact
                 "Subtype": node.get("subtype", ""),
                 "External ID": node.get("id", ""),
                 "Species": ", ".join(map(str, node.get("species", []))) if node.get("species") else "",
-                "Is Keyword": True  # 标记为关键词实体
+                "Is Keyword": True,  # 标记为关键词实体
+                "Novelty": novelty  # 添加新颖性信息
             }
+            
+            # 添加额外的元数据，如果存在
+            if "metadata" in node:
+                entity["Metadata"] = str(node["metadata"])
+            
+            # 添加更新日期
+            if "updated_at" in node:
+                entity["Updated At"] = node["updated_at"]
             
             matched_entities.append(entity)
     
@@ -309,6 +325,29 @@ def extract_entities_by_ids(nodes_data, entity_ids, entity_types=None):
             cleaned_official_name = clean_non_ascii_chars(node.get("official name", ""), preserve_greek=True)
             cleaned_common_name = clean_non_ascii_chars(node.get("common name", ""), preserve_greek=True)
             
+            # 探索节点，寻找新颖性信息，使用所有可能的键名
+            novelty_keys = ["novelty", "Novelty", "novel", "Novel", "novelty_score", "novel_score"]
+            novelty = None
+            for key in novelty_keys:
+                if key in node and node[key] is not None:
+                    try:
+                        # 尝试将值转换为数字
+                        novelty = float(node[key])
+                        break
+                    except (ValueError, TypeError):
+                        # 如果不是数字，保留原始值
+                        novelty = node[key]
+                        break
+            
+            # 如果没有直接的新颖性字段，尝试从关系数据中推断
+            if novelty is None and "relations" in node:
+                relations = node.get("relations", [])
+                if relations and isinstance(relations, list) and len(relations) > 0:
+                    for rel in relations:
+                        if isinstance(rel, dict) and "novelty" in rel:
+                            novelty = rel["novelty"]
+                            break
+            
             # 创建实体记录
             entity = {
                 "Original ID": entity_id,
@@ -319,8 +358,17 @@ def extract_entities_by_ids(nodes_data, entity_ids, entity_types=None):
                 "Subtype": node.get("subtype", ""),
                 "External ID": node.get("id", ""),
                 "Species": ", ".join(map(str, node.get("species", []))) if node.get("species") else "",
-                "Is Keyword": entity_id in entity_id_set  # 标记关键词实体
+                "Is Keyword": entity_id in entity_id_set,  # 标记关键词实体
+                "Novelty": novelty  # 添加新颖性信息
             }
+            
+            # 添加额外的元数据，如果存在
+            if "metadata" in node:
+                entity["Metadata"] = str(node["metadata"])
+            
+            # 添加更新日期
+            if "updated_at" in node:
+                entity["Updated At"] = node["updated_at"]
             
             matched_entities.append(entity)
     
@@ -450,3 +498,5 @@ def get_entity_by_id(entities_df, entity_id, id_column='ID'):
     else:
         logger.warning(f"未找到ID为 '{entity_id}' 的实体")
         return None
+
+

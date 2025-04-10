@@ -58,12 +58,18 @@ def build_networkx_graph(entities, relations, include_attributes=True):
                 if col != 'ID':
                     attrs[col] = entity[col]
         else:
-            # 仅包含基本属性
+            # 仅包含基本属性，确保包含名称
             attrs = {
                 'name': entity.get('Name', ''),
                 'type': entity.get('Type', ''),
                 'is_keyword': entity.get('Is Keyword', False)
             }
+        
+        # 确保有名称属性
+        if 'name' not in attrs and 'Name' in attrs:
+            attrs['name'] = attrs['Name']
+        elif 'Name' not in attrs and 'name' in attrs:
+            attrs['Name'] = attrs['name']
         
         # 添加节点
         G.add_node(node_id, **attrs)
@@ -86,7 +92,7 @@ def build_networkx_graph(entities, relations, include_attributes=True):
                 if col not in ['Source ID', 'Target ID']:
                     edge_attrs[col] = relation[col]
         else:
-            # 仅包含基本属性
+            # 仅包含基本属性，确保包含类型和置信度
             edge_attrs = {
                 'relation_type': relation.get('Relation Type', 'Unknown'),
                 'confidence': float(relation.get('Confidence', 0.5)),

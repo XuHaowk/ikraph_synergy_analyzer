@@ -114,9 +114,27 @@ def extract_relations_with_entities(relations_data, entity_ids, relation_schema=
             relation_type = "Unknown"
             
             # 如果有关系模式，尝试解析关系类型
-            if relation_schema and relation_type_id in relation_schema:
-                if isinstance(relation_schema[relation_type_id], dict) and "name" in relation_schema[relation_type_id]:
-                    relation_type = relation_schema[relation_type_id]["name"]
+            if relation_schema:
+                # 尝试不同格式的键查找
+                if relation_type_id in relation_schema:
+                    if isinstance(relation_schema[relation_type_id], dict) and "name" in relation_schema[relation_type_id]:
+                        relation_type = relation_schema[relation_type_id]["name"]
+                    else:
+                        relation_type = relation_schema[relation_type_id]
+                # 尝试整数键
+                elif relation_type_id.isdigit():
+                    int_key = int(relation_type_id)
+                    if int_key in relation_schema:
+                        if isinstance(relation_schema[int_key], dict) and "name" in relation_schema[int_key]:
+                            relation_type = relation_schema[int_key]["name"]
+                        else:
+                            relation_type = relation_schema[int_key]
+                    # 尝试字符串形式的整数键
+                    elif str(int_key) in relation_schema:
+                        if isinstance(relation_schema[str(int_key)], dict) and "name" in relation_schema[str(int_key)]:
+                            relation_type = relation_schema[str(int_key)]["name"]
+                        else:
+                            relation_type = relation_schema[str(int_key)]
             
             if relation_type == "Unknown":
                 unmapped_relation_types.add(relation_type_id)
@@ -196,8 +214,8 @@ def extract_relations_with_entities(relations_data, entity_ids, relation_schema=
                 continue
             
             # 灵活提取源ID和目标ID
-            source_id = next((item.get(key) for key in source_id_keys if item.get(key)), None)
-            target_id = next((item.get(key) for key in target_id_keys if item.get(key)), None)
+            source_id = next((item.get(key) for key in source_id_keys if key in item), None)
+            target_id = next((item.get(key) for key in target_id_keys if key in item), None)
             
             # 跳过缺少源或目标ID的关系
             if not source_id or not target_id:
@@ -207,13 +225,36 @@ def extract_relations_with_entities(relations_data, entity_ids, relation_schema=
             if source_id not in entity_id_set and target_id not in entity_id_set:
                 continue
             
-            # 灵活提取关系类型
+            # 灵活提取关系类型及ID
             relation_type_keys = ['relationship_type', 'Relation Type', 'type', 'relation_type']
-            relation_type = next((item.get(key) for key in relation_type_keys if item.get(key)), "Unknown")
+            relation_type_id = next((str(item.get(key)) for key in relation_type_keys if key in item), "Unknown")
+            relation_type = "Unknown"
+            
+            # 尝试从关系模式中获取可读名称
+            if relation_schema:
+                # 直接查找
+                if relation_type_id in relation_schema:
+                    if isinstance(relation_schema[relation_type_id], dict) and "name" in relation_schema[relation_type_id]:
+                        relation_type = relation_schema[relation_type_id]["name"]
+                    else:
+                        relation_type = relation_schema[relation_type_id]
+                # 尝试作为整数查找
+                elif relation_type_id.isdigit():
+                    int_key = int(relation_type_id)
+                    if int_key in relation_schema:
+                        if isinstance(relation_schema[int_key], dict) and "name" in relation_schema[int_key]:
+                            relation_type = relation_schema[int_key]["name"]
+                        else:
+                            relation_type = relation_schema[int_key]
+                    elif str(int_key) in relation_schema:
+                        if isinstance(relation_schema[str(int_key)], dict) and "name" in relation_schema[str(int_key)]:
+                            relation_type = relation_schema[str(int_key)]["name"]
+                        else:
+                            relation_type = relation_schema[str(int_key)]
             
             # 灵活提取置信度和得分
-            confidence = float(next((item.get(key) for key in ['prob', 'confidence', 'Confidence'] if item.get(key) is not None), 0.0))
-            score = float(next((item.get(key) for key in ['score', 'Score'] if item.get(key) is not None), 0.0))
+            confidence = float(next((item.get(key) for key in ['prob', 'confidence', 'Confidence'] if key in item and item.get(key) is not None), 0.0))
+            score = float(next((item.get(key) for key in ['score', 'Score'] if key in item and item.get(key) is not None), 0.0))
             
             # 应用置信度过滤
             if min_confidence > 0 and confidence < min_confidence:
@@ -224,6 +265,7 @@ def extract_relations_with_entities(relations_data, entity_ids, relation_schema=
                 "Original Source ID": source_id,
                 "Original Target ID": target_id,
                 "Relation Type": relation_type,
+                "Relation Type ID": relation_type_id,
                 "Confidence": confidence,
                 "Score": score,
                 "Source": item.get("source", "Database")
@@ -237,7 +279,7 @@ def extract_relations_with_entities(relations_data, entity_ids, relation_schema=
             
             # 记录未映射的关系类型
             if relation_type == "Unknown":
-                unmapped_relation_types.add(str(item))
+                unmapped_relation_types.add(str(relation_type_id))
     
     # 处理字典格式的关系数据
     elif isinstance(relations_data, dict):
@@ -249,8 +291,8 @@ def extract_relations_with_entities(relations_data, entity_ids, relation_schema=
                 continue
             
             # 灵活提取源ID和目标ID
-            source_id = next((rel_data.get(key) for key in source_id_keys if rel_data.get(key)), None)
-            target_id = next((rel_data.get(key) for key in target_id_keys if rel_data.get(key)), None)
+            source_id = next((rel_data.get(key) for key in source_id_keys if key in rel_data), None)
+            target_id = next((rel_data.get(key) for key in target_id_keys if key in rel_data), None)
             
             # 尝试从关系ID解析源和目标ID
             if (not source_id or not target_id) and isinstance(rel_id, str):
@@ -269,20 +311,40 @@ def extract_relations_with_entities(relations_data, entity_ids, relation_schema=
             
             # 灵活提取关系类型
             relation_type_keys = ['relationship_type', 'Relation Type', 'type', 'relation_type']
-            relation_type = next((rel_data.get(key) for key in relation_type_keys if rel_data.get(key)), "Unknown")
+            relation_type_id = next((str(rel_data.get(key)) for key in relation_type_keys if key in rel_data), "Unknown")
+            relation_type = "Unknown"
             
             # 如果关系类型未找到，尝试从关系ID中提取
-            if relation_type == "Unknown" and isinstance(rel_id, str):
+            if relation_type_id == "Unknown" and isinstance(rel_id, str):
                 parts = rel_id.split('.')
                 if len(parts) >= 3:
                     relation_type_id = parts[2]
-                    # 如果有关系模式，尝试查找关系类型
-                    if relation_schema and relation_type_id in relation_schema:
+            
+            # 尝试从关系模式中获取可读名称
+            if relation_schema:
+                # 直接查找
+                if relation_type_id in relation_schema:
+                    if isinstance(relation_schema[relation_type_id], dict) and "name" in relation_schema[relation_type_id]:
                         relation_type = relation_schema[relation_type_id]["name"]
+                    else:
+                        relation_type = relation_schema[relation_type_id]
+                # 尝试作为整数查找
+                elif relation_type_id.isdigit():
+                    int_key = int(relation_type_id)
+                    if int_key in relation_schema:
+                        if isinstance(relation_schema[int_key], dict) and "name" in relation_schema[int_key]:
+                            relation_type = relation_schema[int_key]["name"]
+                        else:
+                            relation_type = relation_schema[int_key]
+                    elif str(int_key) in relation_schema:
+                        if isinstance(relation_schema[str(int_key)], dict) and "name" in relation_schema[str(int_key)]:
+                            relation_type = relation_schema[str(int_key)]["name"]
+                        else:
+                            relation_type = relation_schema[str(int_key)]
             
             # 灵活提取置信度和得分
-            confidence = float(next((rel_data.get(key) for key in ['prob', 'confidence', 'Confidence'] if rel_data.get(key) is not None), 0.0))
-            score = float(next((rel_data.get(key) for key in ['score', 'Score'] if rel_data.get(key) is not None), 0.0))
+            confidence = float(next((rel_data.get(key) for key in ['prob', 'confidence', 'Confidence'] if key in rel_data and rel_data.get(key) is not None), 0.0))
+            score = float(next((rel_data.get(key) for key in ['score', 'Score'] if key in rel_data and rel_data.get(key) is not None), 0.0))
             
             # 应用置信度过滤
             if min_confidence > 0 and confidence < min_confidence:
@@ -293,6 +355,7 @@ def extract_relations_with_entities(relations_data, entity_ids, relation_schema=
                 "Original Source ID": source_id,
                 "Original Target ID": target_id,
                 "Relation Type": relation_type,
+                "Relation Type ID": relation_type_id,
                 "Confidence": confidence,
                 "Score": score,
                 "Source": rel_data.get("source", "Database")
@@ -306,7 +369,7 @@ def extract_relations_with_entities(relations_data, entity_ids, relation_schema=
             
             # 记录未映射的关系类型
             if relation_type == "Unknown":
-                unmapped_relation_types.add(str(rel_data))
+                unmapped_relation_types.add(str(relation_type_id))
     
     else:
         logger.error(f"不支持的关系数据类型: {type(relations_data)}")
@@ -696,29 +759,55 @@ def add_entity_names_to_relations(relations, entities_df):
     """向关系添加实体名称，优先使用通用名称，清理中文字符但保留希腊字母"""
     logger.info("向关系添加实体名称...")
     
-    # 创建ID到名称的映射
-    id_to_official_name = dict(zip(entities_df["ID"], entities_df["Official_Name"]))
-    id_to_common_name = dict(zip(entities_df["ID"], entities_df["Common_Name"]))
-    id_to_type = dict(zip(entities_df["ID"], entities_df["Type"]))
+    # 创建ID到名称和其他信息的映射
+    id_to_name = {}
+    for _, entity in entities_df.iterrows():
+        entity_id = entity["ID"]
+        # 优先使用通用名称，如果没有则使用官方名称
+        name = entity.get("Common_Name", "") if entity.get("Common_Name", "") else entity.get("Official_Name", "")
+        if not name:
+            name = entity.get("Name", f"实体 {entity_id}")
+        
+        id_to_name[entity_id] = {
+            "name": name,
+            "official_name": entity.get("Official_Name", ""),
+            "common_name": entity.get("Common_Name", ""),
+            "type": entity.get("Type", "Unknown"),
+            "subtype": entity.get("Subtype", ""),
+            "external_id": entity.get("External ID", ""),
+            "is_keyword": entity.get("Is Keyword", False),
+            # 添加新颖性信息，如果有的话
+            "novelty": entity.get("Novelty", None)
+        }
     
     # 添加名称和类型到关系
     for relation in tqdm(relations, desc="向关系添加实体名称"):
         source_id = relation["Source ID"]
         target_id = relation["Target ID"]
         
-        # 优先使用通用名称，如果没有则使用官方名称
-        source_common = id_to_common_name.get(source_id, "")
-        source_official = id_to_official_name.get(source_id, "")
-        target_common = id_to_common_name.get(target_id, "")
-        target_official = id_to_official_name.get(target_id, "")
+        # 获取源实体信息
+        source_info = id_to_name.get(source_id, {})
+        # 获取目标实体信息
+        target_info = id_to_name.get(target_id, {})
         
-        # 使用清理函数处理名称，保留希腊字母
-        relation["Source Name"] = source_common if source_common else source_official
-        relation["Source Official Name"] = source_official
-        relation["Target Name"] = target_common if target_common else target_official
-        relation["Target Official Name"] = target_official
-        relation["Source Type"] = id_to_type.get(source_id, "Unknown")
-        relation["Target Type"] = id_to_type.get(target_id, "Unknown")
+        # 添加实体名称和类型到关系
+        relation["Source Name"] = source_info.get("name", f"实体 {source_id}")
+        relation["Source Official Name"] = source_info.get("official_name", "")
+        relation["Source Common Name"] = source_info.get("common_name", "")
+        relation["Source Type"] = source_info.get("type", "Unknown")
+        relation["Source External ID"] = source_info.get("external_id", "")
+        relation["Source Is Keyword"] = source_info.get("is_keyword", False)
+        
+        relation["Target Name"] = target_info.get("name", f"实体 {target_id}")
+        relation["Target Official Name"] = target_info.get("official_name", "")
+        relation["Target Common Name"] = target_info.get("common_name", "")
+        relation["Target Type"] = target_info.get("type", "Unknown")
+        relation["Target External ID"] = target_info.get("external_id", "")
+        relation["Target Is Keyword"] = target_info.get("is_keyword", False)
+        
+        # 添加新颖性信息
+        relation["Source Novelty"] = source_info.get("novelty", None)
+        relation["Target Novelty"] = target_info.get("novelty", None)
     
     return relations
 
@@ -744,7 +833,7 @@ def update_relation_entity_ids(relations, entity_id_map):
 
 def merge_duplicate_relations(relations):
     """
-    根据iKraph结构合并重复的关系记录，忽略大小写差异
+    根据iKraph结构合并重复的关系记录，忽略大小写差异，每对实体只保留一个关系
     """
     logger.info("正在合并重复的关系记录...")
     
@@ -752,7 +841,7 @@ def merge_duplicate_relations(relations):
     original_count = len(relations)
     
     # 用于标识唯一关系的键（标准化源ID、目标ID和关系类型，包括大小写处理）
-    grouped_relations = {}
+    unique_relations = {}
     
     # 按源实体、目标实体和关系类型分组
     for relation in tqdm(relations, desc="合并重复关系"):
@@ -760,88 +849,25 @@ def merge_duplicate_relations(relations):
         rel_type = relation.get("Relation Type", "")
         rel_type_lower = rel_type.lower() if isinstance(rel_type, str) else rel_type
         
-        key = (relation.get("Original Source ID", ""), 
-               relation.get("Original Target ID", ""), 
-               rel_type_lower)  # 关系类型转为小写
+        key = (
+            relation.get("Original Source ID", ""), 
+            relation.get("Original Target ID", ""), 
+            rel_type_lower
+        )  # 关系类型转为小写
         
         # 跳过缺少关键数据的关系
         if not all(key):
             continue
-            
-        if key not in grouped_relations:
-            # 第一次遇到此关系，创建新记录
-            base_record = {k: v for k, v in relation.items() 
-                          if k not in ["Document", "Score", "Confidence", "Novelty"]}
-            
-            # 保留原始大小写格式的关系类型
-            base_record["Original_Relation_Type"] = rel_type
-            base_record["Evidence"] = []
-            base_record["Max_Confidence"] = 0
-            base_record["Avg_Confidence"] = 0
-            base_record["Evidence_Count"] = 0
-            grouped_relations[key] = base_record
-        else:
-            # 如果当前关系类型有更好的格式（比如首字母大写而不是全大写或全小写）
-            current_rel_type = relation.get("Relation Type", "")
-            if isinstance(current_rel_type, str):
-                curr_lower = current_rel_type.lower()
-                curr_upper = current_rel_type.upper()
-                
-                # 检查当前值是否比保存值更合适（首字母大写优于全大写或全小写）
-                if current_rel_type != curr_lower and current_rel_type != curr_upper:
-                    grouped_relations[key]["Original_Relation_Type"] = current_rel_type
         
-        # 添加证据
-        evidence = {
-            "Document": relation.get("Document", ""),
-            "Score": relation.get("Score", 0),
-            "Confidence": relation.get("Confidence", 0),
-            "Novelty": relation.get("Novelty", None)
-        }
+        # 获取当前关系的置信度
+        current_confidence = float(relation.get("Confidence", 0))
         
-        # 更新聚合统计
-        conf = float(evidence["Confidence"]) if evidence["Confidence"] else 0
-        grouped_relations[key]["Evidence"].append(evidence)
-        grouped_relations[key]["Evidence_Count"] += 1
-        grouped_relations[key]["Max_Confidence"] = max(grouped_relations[key]["Max_Confidence"], conf)
-        
-        # 更新平均置信度
-        total = grouped_relations[key]["Avg_Confidence"] * (grouped_relations[key]["Evidence_Count"] - 1)
-        grouped_relations[key]["Avg_Confidence"] = (total + conf) / grouped_relations[key]["Evidence_Count"]
+        # 如果键不在唯一关系中，或者当前关系的置信度高于已有的，则替换/添加
+        if key not in unique_relations or current_confidence > unique_relations[key].get("Confidence", 0):
+            unique_relations[key] = relation
     
-    # 转换回列表并格式化输出
-    result = []
-    for key, rel_data in grouped_relations.items():
-        # 选择最高置信度的证据作为主要显示
-        best_evidence = max(rel_data["Evidence"], 
-                           key=lambda e: e["Confidence"] if e["Confidence"] else 0) if rel_data["Evidence"] else {}
-        
-        # 创建输出记录
-        output_record = {k: v for k, v in rel_data.items() 
-                        if k not in ["Evidence", "Avg_Confidence"]}
-        
-        # 使用更好格式的关系类型
-        if "Original_Relation_Type" in output_record:
-            output_record["Relation Type"] = output_record["Original_Relation_Type"]
-            del output_record["Original_Relation_Type"]
-        
-        # 添加主要证据信息
-        output_record["Confidence"] = rel_data["Max_Confidence"]
-        output_record["Score"] = best_evidence.get("Score", 0)
-        output_record["Document"] = best_evidence.get("Document", "")
-        if "Novelty" in best_evidence and best_evidence["Novelty"] is not None:
-            output_record["Novelty"] = best_evidence["Novelty"]
-        
-        # 添加证据摘要信息
-        output_record["Evidence_Summary"] = f"{rel_data['Evidence_Count']} references"
-        if rel_data["Evidence_Count"] > 1:
-            output_record["Other_Documents"] = "|".join(str(e.get("Document", "")) 
-                                                      for e in rel_data["Evidence"][:5] 
-                                                      if e.get("Document") != output_record["Document"])
-            if len(rel_data["Evidence"]) > 5:
-                output_record["Other_Documents"] += f"... (+{len(rel_data['Evidence'])-5} more)"
-        
-        result.append(output_record)
+    # 转换回列表
+    result = list(unique_relations.values())
     
     logger.info(f"合并完成：从 {original_count} 条关系记录合并为 {len(result)} 条")
     return result
@@ -942,5 +968,11 @@ def filter_relations_by_entity_types(relations, entity_type_pairs):
     
     logger.info(f"按实体类型对过滤: 从 {len(relations)} 条关系中筛选出 {len(filtered)} 条")
     return filtered 
+
+
+
+
+
+
 
 

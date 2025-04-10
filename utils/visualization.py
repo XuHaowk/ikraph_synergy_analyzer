@@ -69,6 +69,14 @@ def generate_network_visualization(G, output_file, title="网络图", height="80
             node_type = attrs.get("type", "Unknown")
             is_keyword = attrs.get("is_keyword", False)
             
+            # 获取节点名称 - 优先使用名称而不是ID
+            node_name = attrs.get('name', '')
+            if not node_name:
+                node_name = attrs.get('Name', '')
+            if not node_name:
+                # 如果没有名称，则使用ID作为后备
+                node_name = str(node)
+            
             # 节点颜色
             color = get_node_color(node_type, is_keyword)
             
@@ -76,14 +84,16 @@ def generate_network_visualization(G, output_file, title="网络图", height="80
             size = 30 if is_keyword else 20 if node_type in ["Chemical", "Disease", "Drug"] else 15
             
             # 节点标题（鼠标悬停显示）
-            title = f"<b>{node_type}: {attrs.get('name', '')}</b><br>"
+            title = f"<b>{node_type}: {node_name}</b><br>"
             if "External ID" in attrs and attrs["External ID"]:
                 title += f"ID: {attrs['External ID']}<br>"
+            # 添加原始ID显示为悬停提示
+            title += f"原始ID: {node}<br>"
             
-            # 添加节点
+            # 添加节点 - 使用名称作为标签
             net.add_node(
                 node, 
-                label=attrs.get("name", ""),
+                label=node_name,
                 title=title,
                 color=color,
                 size=size
@@ -92,30 +102,41 @@ def generate_network_visualization(G, output_file, title="网络图", height="80
         # 添加边
         for source, target, attrs in G.edges(data=True):
             # 边标题
-            edge_title = f"<b>{attrs.get('relation_type', 'Unknown')}</b><br>"
+            rel_type = attrs.get('relation_type', attrs.get('Relation Type', 'Unknown'))
+            rel_type_id = attrs.get('Relation Type ID', '')
+            
+            edge_title = f"<b>{rel_type}</b><br>"
+            if rel_type_id:
+                edge_title += f"类型ID: {rel_type_id}<br>"
             if "confidence" in attrs:
-                edge_title += f"Confidence: {attrs.get('confidence', 0):.2f}<br>"
+                edge_title += f"置信度: {attrs.get('confidence', 0):.2f}<br>"
+            if "Confidence" in attrs:
+                edge_title += f"置信度: {attrs.get('Confidence', 0):.2f}<br>"
             if "direction" in attrs:
                 direction = attrs.get("direction")
                 if direction == 1:
-                    edge_title += "Direction: Positive<br>"
+                    edge_title += "方向: 正向<br>"
                 elif direction == -1:
-                    edge_title += "Direction: Negative<br>"
+                    edge_title += "方向: 负向<br>"
+            if "Direction" in attrs:
+                direction = attrs.get("Direction")
+                if direction == 1:
+                    edge_title += "方向: 正向<br>"
+                elif direction == -1:
+                    edge_title += "方向: 负向<br>"
             
             # 边宽度和颜色
-            width = 1 + 2 * attrs.get("confidence", 0.5)
+            confidence = attrs.get("confidence", attrs.get("Confidence", 0.5))
+            width = 1 + 2 * confidence
             
             # 如果有方向信息，边颜色可以显示方向
-            if "direction" in attrs:
-                direction = attrs.get("direction")
-                if direction == 1:
-                    color = "#1f77b4"  # 蓝色：正向
-                elif direction == -1:
-                    color = "#d62728"  # 红色：负向
-                else:
-                    color = "#7f7f7f"  # 灰色：中性
+            direction = attrs.get("direction", attrs.get("Direction", 0))
+            if direction == 1:
+                color = "#1f77b4"  # 蓝色：正向
+            elif direction == -1:
+                color = "#d62728"  # 红色：负向
             else:
-                color = "#7f7f7f"
+                color = "#7f7f7f"  # 灰色：中性
             
             # 添加边
             net.add_edge(
@@ -123,7 +144,12 @@ def generate_network_visualization(G, output_file, title="网络图", height="80
                 target,
                 title=edge_title,
                 width=width,
-                color=color
+                color=color,
+                arrowStrikethrough=False,  # 防止箭头穿透节点
+                smooth={  # 平滑的弯曲边缘
+                    "type": "curvedCW",
+                    "roundness": 0.2
+                }
             )
         
         # 配置物理引擎
@@ -136,16 +162,45 @@ def generate_network_visualization(G, output_file, title="网络图", height="80
                     "springLength": 100,
                     "springConstant": 0.08
                 },
+                "maxVelocity": 50,
                 "solver": "forceAtlas2Based",
+                "timestep": 0.35,
                 "stabilization": {
                     "enabled": true,
-                    "iterations": 1000
+                    "iterations": 1000,
+                    "updateInterval": 25
                 }
             },
             "interaction": {
                 "navigationButtons": true,
                 "keyboard": true,
-                "tooltipDelay": 300
+                "tooltipDelay": 300,
+                "hover": true
+            },
+            "edges": {
+                "smooth": {
+                    "enabled": true,
+                    "type": "dynamic"
+                },
+                "arrows": {
+                    "to": {
+                        "enabled": true,
+                        "scaleFactor": 0.5
+                    }
+                }
+            },
+            "nodes": {
+                "font": {
+                    "size": 14,
+                    "face": "Arial"
+                },
+                "scaling": {
+                    "label": {
+                        "enabled": true,
+                        "min": 8,
+                        "max": 20
+                    }
+                }
             }
         }
         """)
@@ -158,6 +213,8 @@ def generate_network_visualization(G, output_file, title="网络图", height="80
     
     except Exception as e:
         logger.error(f"生成网络可视化时出错: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
         return None
 
 def generate_synergy_heatmap(synergy_scores, output_file, title="药物协同热图"):
@@ -409,8 +466,16 @@ def generate_mechanism_diagram(mechanisms, output_file, title="作用机制图")
             gene_id = mechanism.get('gene_id', 'Unknown')
             gene_name = mechanism.get('gene_name', 'Unknown Gene')
             
-            target_id = mechanism.get('target_id', mechanism.get('toxicity_id', 'Unknown'))
+            target_id = mechanism.get('target_id', mechanism.get('toxicity_node', 'Unknown'))
             target_name = mechanism.get('target_name', mechanism.get('toxicity_name', 'Unknown Target'))
+            
+            # 确保有实际名称
+            if not drug_name or drug_name == "Unknown Drug":
+                drug_name = f"Drug {drug_id}"
+            if not gene_name or gene_name == "Unknown Gene":
+                gene_name = f"Gene {gene_id}"
+            if not target_name or target_name == "Unknown Target":
+                target_name = f"Target {target_id}"
             
             # 添加节点
             G.add_node(drug_id, name=drug_name, type='Drug')
@@ -418,13 +483,18 @@ def generate_mechanism_diagram(mechanisms, output_file, title="作用机制图")
             G.add_node(target_id, name=target_name, type='Target')
             
             # 提取关系方向
-            drug_gene_direction = mechanism.get('drug_gene_direction', 0)
+            drug_gene_direction = mechanism.get('drug_gene_direction', mechanism.get('protective_drug_effect', 
+                                             mechanism.get('toxicity_drug_effect', 0)))
             gene_target_direction = mechanism.get('gene_target_direction', 
-                                              mechanism.get('gene_toxicity_direction', 0))
+                                              mechanism.get('gene_toxicity_direction', 
+                                               mechanism.get('gene_toxicity_relation', 0)))
             
             # 添加边
             G.add_edge(drug_id, gene_id, direction=drug_gene_direction)
-            G.add_edge(gene_id, target_id, direction=gene_target_direction)
+            
+            # 只有当gene_target_direction不为None时才添加到target的边
+            if gene_target_direction is not None:
+                G.add_edge(gene_id, target_id, direction=gene_target_direction)
             
             # 收集节点
             all_nodes.add((drug_id, drug_name, 'Drug'))
@@ -439,27 +509,33 @@ def generate_mechanism_diagram(mechanisms, output_file, title="作用机制图")
         gene_nodes = [node for node, attrs in G.nodes(data=True) if attrs.get('type') == 'Gene']
         target_nodes = [node for node, attrs in G.nodes(data=True) if attrs.get('type') == 'Target']
         
+        # 绘制图
         plt.subplot(1, 1, 1)
-        nx.draw_networkx_nodes(G, pos, nodelist=drug_nodes, node_color='blue', node_size=500, alpha=0.8, label='Drugs')
-        nx.draw_networkx_nodes(G, pos, nodelist=gene_nodes, node_color='green', node_size=500, alpha=0.8, label='Genes')
-        nx.draw_networkx_nodes(G, pos, nodelist=target_nodes, node_color='red', node_size=500, alpha=0.8, label='Targets')
+        
+        # 绘制节点 - 使用不同的颜色和大小
+        nx.draw_networkx_nodes(G, pos, nodelist=drug_nodes, node_color='blue', node_size=700, alpha=0.8, label='药物')
+        nx.draw_networkx_nodes(G, pos, nodelist=gene_nodes, node_color='green', node_size=600, alpha=0.8, label='基因')
+        nx.draw_networkx_nodes(G, pos, nodelist=target_nodes, node_color='red', node_size=700, alpha=0.8, label='靶点/毒性')
         
         # 绘制边，不同颜色表示不同方向
         positive_edges = [(u, v) for u, v, d in G.edges(data=True) if d.get('direction', 0) > 0]
         negative_edges = [(u, v) for u, v, d in G.edges(data=True) if d.get('direction', 0) < 0]
         neutral_edges = [(u, v) for u, v, d in G.edges(data=True) if d.get('direction', 0) == 0]
         
-        nx.draw_networkx_edges(G, pos, edgelist=positive_edges, edge_color='green', arrows=True, width=2, label='Activation')
-        nx.draw_networkx_edges(G, pos, edgelist=negative_edges, edge_color='red', arrows=True, width=2, label='Inhibition')
-        nx.draw_networkx_edges(G, pos, edgelist=neutral_edges, edge_color='gray', arrows=True, width=1, label='Unknown')
+        nx.draw_networkx_edges(G, pos, edgelist=positive_edges, edge_color='green', arrows=True, width=2, 
+                               label='激活', arrowsize=20, arrowstyle='->')
+        nx.draw_networkx_edges(G, pos, edgelist=negative_edges, edge_color='red', arrows=True, width=2, 
+                               label='抑制', arrowsize=20, arrowstyle='->')
+        nx.draw_networkx_edges(G, pos, edgelist=neutral_edges, edge_color='gray', arrows=True, width=1, 
+                               label='未知方向', arrowsize=15, arrowstyle='->')
         
-        # 添加节点标签
+        # 添加节点标签 - 使用实际名称而不是ID
         labels = {node: G.nodes[node]['name'] for node in G.nodes()}
-        nx.draw_networkx_labels(G, pos, labels=labels, font_size=10)
+        nx.draw_networkx_labels(G, pos, labels=labels, font_size=10, font_family='SimHei')  # SimHei字体支持中文
         
-        plt.title(title)
+        plt.title(title, fontsize=16, fontname='SimHei')  # 使用支持中文的字体
         plt.axis('off')
-        plt.legend()
+        plt.legend(loc='upper right', fontsize=12)
         plt.tight_layout()
         
         # 保存图形
@@ -472,4 +548,6 @@ def generate_mechanism_diagram(mechanisms, output_file, title="作用机制图")
     
     except Exception as e:
         logger.error(f"生成作用机制图时出错: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
         return None
